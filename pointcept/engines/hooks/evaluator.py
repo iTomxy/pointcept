@@ -5,6 +5,7 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
+import os, json
 import numpy as np
 import wandb
 import torch
@@ -13,7 +14,8 @@ import pointops
 from uuid import uuid4
 
 import pointcept.utils.comm as comm
-from pointcept.utils.misc import intersection_and_union_gpu
+from pointcept.utils.logger import get_logger
+from pointcept.utils.misc import intersection_and_union_gpu, confusion_matrix, calc_cm_metrics
 
 from .default import HookBase
 from .builder import HOOKS
@@ -26,7 +28,7 @@ class ClsEvaluator(HookBase):
             self.eval()
 
     def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Cls Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
         for i, input_dict in enumerate(self.trainer.val_loader):
             for key in input_dict.keys():
@@ -112,12 +114,21 @@ class SemSegEvaluator(HookBase):
         if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
             wandb.define_metric("val/*", step_metric="Epoch")
 
+        # (21 Sept 2025, iTom) use an individual logger
+        if comm.is_main_process():
+            self.json_logger = get_logger(
+                "semseg_json_val",
+                log_file=os.path.join(self.trainer.cfg.save_path, "semseg_val.json"),
+                file_mode="a",
+                fmt="%(message)s"
+            )
+
     def after_epoch(self):
         if self.trainer.cfg.evaluate:
             self.eval()
 
     def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Sem Seg Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
         for i, input_dict in enumerate(self.trainer.val_loader):
             for key in input_dict.keys():
@@ -133,25 +144,39 @@ class SemSegEvaluator(HookBase):
                 assert "origin_segment" in input_dict.keys()
                 pred = pred[input_dict["inverse"]]
                 segment = input_dict["origin_segment"]
-            intersection, union, target = intersection_and_union_gpu(
+            # intersection, union, target = intersection_and_union_gpu(
+            #     pred,
+            #     segment,
+            #     self.trainer.cfg.data.num_classes,
+            #     self.trainer.cfg.data.ignore_index,
+            # )
+            tp, tn, fp, fn = confusion_matrix(
                 pred,
                 segment,
                 self.trainer.cfg.data.num_classes,
                 self.trainer.cfg.data.ignore_index,
             )
             if comm.get_world_size() > 1:
-                dist.all_reduce(intersection), dist.all_reduce(union), dist.all_reduce(
-                    target
-                )
-            intersection, union, target = (
-                intersection.cpu().numpy(),
-                union.cpu().numpy(),
-                target.cpu().numpy(),
-            )
+                # dist.all_reduce(intersection), dist.all_reduce(union), dist.all_reduce(
+                #     target
+                # )
+                dist.all_reduce(tp)
+                dist.all_reduce(tn)
+                dist.all_reduce(fp)
+                dist.all_reduce(fn)
+            # intersection, union, target = (
+            #     intersection.cpu().numpy(),
+            #     union.cpu().numpy(),
+            #     target.cpu().numpy(),
+            # )
             # Here there is no need to sync since sync happened in dist.all_reduce
-            self.trainer.storage.put_scalar("val_intersection", intersection)
-            self.trainer.storage.put_scalar("val_union", union)
-            self.trainer.storage.put_scalar("val_target", target)
+            # self.trainer.storage.put_scalar("val_intersection", intersection)
+            # self.trainer.storage.put_scalar("val_union", union)
+            # self.trainer.storage.put_scalar("val_target", target)
+            self.trainer.storage.put_scalar("val_tp", tp.cpu().numpy())
+            self.trainer.storage.put_scalar("val_fp", fp.cpu().numpy())
+            self.trainer.storage.put_scalar("val_tn", tn.cpu().numpy())
+            self.trainer.storage.put_scalar("val_fn", fn.cpu().numpy())
             self.trainer.storage.put_scalar("val_loss", loss.item())
             info = "Test: [{iter}/{max_iter}] ".format(
                 iter=i + 1, max_iter=len(self.trainer.val_loader)
@@ -165,66 +190,90 @@ class SemSegEvaluator(HookBase):
                 )
             )
         loss_avg = self.trainer.storage.history("val_loss").avg
-        intersection = self.trainer.storage.history("val_intersection").total
-        union = self.trainer.storage.history("val_union").total
-        target = self.trainer.storage.history("val_target").total
-        iou_class = intersection / (union + 1e-10)
-        acc_class = intersection / (target + 1e-10)
-        m_iou = np.mean(iou_class)
-        m_acc = np.mean(acc_class)
-        all_acc = sum(intersection) / (sum(target) + 1e-10)
+        # intersection = self.trainer.storage.history("val_intersection").total
+        # union = self.trainer.storage.history("val_union").total
+        # target = self.trainer.storage.history("val_target").total
+        # iou_class = intersection / (union + 1e-10)
+        # acc_class = intersection / (target + 1e-10)
+        # m_iou = np.mean(iou_class)
+        # m_acc = np.mean(acc_class)
+        # all_acc = sum(intersection) / (sum(target) + 1e-10)
+        tp = self.trainer.storage.history("val_tp").total
+        fp = self.trainer.storage.history("val_fp").total
+        tn = self.trainer.storage.history("val_tn").total
+        fn = self.trainer.storage.history("val_fn").total
+        metrics = calc_cm_metrics(tp, tn, fp, fn,
+            self.trainer.cfg.data.num_classes, self.trainer.cfg.data.ignore_index)
         self.trainer.logger.info(
             "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
-                m_iou, m_acc, all_acc
+                # m_iou, m_acc, all_acc
+                metrics["iou"], metrics["acc_macro"], metrics["acc_micro"]
             )
         )
-        for i in range(self.trainer.cfg.data.num_classes):
-            self.trainer.logger.info(
-                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
-                    idx=i,
-                    name=self.trainer.cfg.data.names[i],
-                    iou=iou_class[i],
-                    accuracy=acc_class[i],
-                )
-            )
+        # for i in range(self.trainer.cfg.data.num_classes):
+        #     self.trainer.logger.info(
+        #         "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
+        #             idx=i,
+        #             name=self.trainer.cfg.data.names[i],
+        #             iou=iou_class[i],
+        #             accuracy=acc_class[i],
+        #         )
+        #     )
+        for k, v in metrics.items():
+            if isinstance(v, list):
+                self.trainer.logger.info("{}: {}".format(k, ["{:.4f}".format(x) for x in v]))
         current_epoch = self.trainer.epoch + 1
         if self.trainer.writer is not None:
             self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
-            self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
-            self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
-            self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            # self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
+            # self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
+            # self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            for k, v in metrics.items():
+                if isinstance(v, float):
+                    self.trainer.writer.add_scalar("val/{}".format(k), v, current_epoch)
             if self.trainer.cfg.enable_wandb:
                 wandb.log(
                     {
                         "Epoch": current_epoch,
                         "val/loss": loss_avg,
-                        "val/mIoU": m_iou,
-                        "val/mAcc": m_acc,
-                        "val/allAcc": all_acc,
+                        # "val/mIoU": m_iou,
+                        # "val/mAcc": m_acc,
+                        # "val/allAcc": all_acc,
+                        "val/mIoU": metrics["iou"],
+                        "val/mAcc": metrics["acc_macro"],
+                        "val/allAcc": metrics["acc_micro"],
                     },
                     step=wandb.run.step,
                 )
             if self.write_cls_iou:
-                for i in range(self.trainer.cfg.data.num_classes):
+                # for i in range(self.trainer.cfg.data.num_classes):
+                for i in range(len(metrics["iou_class"])):
                     self.trainer.writer.add_scalar(
                         f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU",
-                        iou_class[i],
+                        # iou_class[i],
+                        metrics["iou_class"][i],
                         current_epoch,
                     )
                 if self.trainer.cfg.enable_wandb:
-                    for i in range(self.trainer.cfg.data.num_classes):
+                    # for i in range(self.trainer.cfg.data.num_classes):
+                    for i in range(len(metrics["iou_class"])):
                         wandb.log(
                             {
                                 "Epoch": current_epoch,
-                                f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU": iou_class[
-                                    i
-                                ],
+                                # f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU": iou_class[i],
+                                f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU": metrics["iou_class"][i],
                             },
                             step=wandb.run.step,
                         )
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-        self.trainer.comm_info["current_metric_value"] = m_iou  # save for saver
+        self.trainer.comm_info["current_metric_value"] = metrics["iou"] # m_iou  # save for saver
         self.trainer.comm_info["current_metric_name"] = "mIoU"  # save for saver
+
+        # (21 Sept 2025, iTom) log to json file
+        if comm.is_main_process():
+            log = {"epoch": current_epoch, "loss": loss_avg}
+            log.update(metrics)
+            self.json_logger.info(json.dumps(log))
 
     def after_train(self):
         self.trainer.logger.info(
@@ -250,6 +299,15 @@ class InsSegEvaluator(HookBase):
             for i in range(self.trainer.cfg.data.num_classes)
             if i not in self.segment_ignore_index
         ]
+
+        # (21 Sept 2025, iTom) use an individual logger
+        if comm.is_main_process():
+            self.json_logger = get_logger(
+                "insseg_json_val",
+                log_file=os.path.join(self.trainer.cfg.save_path, "insseg_val.json"),
+                file_mode="a",
+                fmt="%(message)s"
+            )
 
     def after_epoch(self):
         if self.trainer.cfg.evaluate:
@@ -535,7 +593,7 @@ class InsSegEvaluator(HookBase):
         return ap_scores
 
     def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Ins Seg Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
         scenes = []
         for i, input_dict in enumerate(self.trainer.val_loader):
@@ -621,3 +679,13 @@ class InsSegEvaluator(HookBase):
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver
         self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
+
+        # (21 Sept 2025, iTom) log to json file
+        if comm.is_main_process():
+            self.json_logger.info(json.dumps({
+                "epoch": current_epoch,
+                "loss": float(loss_avg),
+                "mAP": float(all_ap),
+                "AP50": float(all_ap_50),
+                "AP25": float(all_ap_25),
+            }))

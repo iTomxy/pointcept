@@ -22,3 +22,6 @@ from .shapenet_part import ShapeNetPartDataset
 
 # dataloader
 from .dataloader import MultiDatasetDataloader
+
+# bone
+from .ribsegv2 import *

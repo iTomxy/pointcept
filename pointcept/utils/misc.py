@@ -65,6 +65,77 @@ def intersection_and_union_gpu(output, target, k, ignore_index=-1):
     return area_intersection, area_union, area_target
 
 
+def confusion_matrix(pred, y, k, ignore_index=-1):
+    """Compute confusion matrix components (TP, TN, FP, FN) for multi-class segmentation.
+    Args:
+        pred: prediction mask of shape [N] or [N, L] or [N, H, W], int
+        y: ground-truth segmentation mask, same shape as pred
+        k: int, #classes
+        ignore_index: Union[int, List[int]] = -1, class ID/s to ignore in computation
+    Returns:
+        tp: int[k], True Positive
+        tn: int[k], True Negative
+        fp: int[k], False Positive
+        fn: int[k], False Negative
+    """
+    assert pred.dim() in [1, 2, 3]
+    assert pred.shape == y.shape
+    if isinstance(ignore_index, int):
+        ignore_index = [ignore_index]
+
+    pred = pred.view(-1)
+    y = y.view(-1)
+    ignore_index = torch.tensor(ignore_index, device=pred.device, dtype=pred.dtype)
+    valid_mask = ~ torch.isin(y, ignore_index)
+    total_valid_pixels = valid_mask.sum().item()
+
+    p_pred = torch.histc(pred[valid_mask], bins=k, min=0, max=k-1)
+    p_y = torch.histc(y[valid_mask], bins=k, min=0, max=k-1)
+    correct_mask = (pred == y) & valid_mask
+
+    tp = torch.histc(y[correct_mask], bins=k, min=0, max=k-1)
+    fp = p_pred - tp
+    fn = p_y - tp
+    tn = total_valid_pixels - tp - fp - fn
+
+    return tp.long(), tn.long(), fp.long(), fn.long()
+
+
+def calc_cm_metrics(tp, tn, fp, fn, class_set, ignore_cls=[]):
+    """calculate Confusion Matrix based metrics
+    Input:
+        tp, tn, fp, fn: int[#classes]
+        class_set: int or List[int]
+            - int: #classes, the class ID set will be {0, ..., n_classes - 1}
+            - List[int]: ordered class ID set in the same order as tp, tn, fp & fn.
+                Can be useful in part segmentation?
+        ignore_cls: List[int] = [], classes to ignore at calculation, e.g. background
+    Output:
+        metrics: dict, {metric<str>: float}
+    """
+    ignore_cls = np.asarray([ignore_cls]).flatten()
+    if ignore_cls.size > 0:
+        class_set = np.arange(class_set) if isinstance(class_set, int) else np.asarray(class_set)
+        mask = ~ np.isin(class_set, ignore_cls)
+        tp, tn, fp, fn = tp[mask], tn[mask], fp[mask], fn[mask]
+
+    metrics = {}
+    metrics["iou_class"] = (tp / np.clip(tp + fp + fn, 1, None)).tolist()
+    metrics["iou"] = float(np.mean(metrics["iou_class"]))
+    metrics["dice_class"] = ((2 * tp) / np.clip((2 * tp + fp + fn), 1, None)).tolist()
+    metrics["dice"] = float(np.mean(metrics["dice_class"]))
+    metrics["prec_class"] = (tp / np.clip(tp + fp, 1, None)).tolist()
+    metrics["precision"] = float(np.mean(metrics["prec_class"]))
+    metrics["sens_class"] = (tp / np.clip(tp + fn, 1, None)).tolist() # recall = sensitivity
+    metrics["sensitivity"] = float(np.mean(metrics["sens_class"]))
+    metrics["spec_class"] = (tn / np.clip(tn + fp, 1, None)).tolist() # specificity = recall for negative class
+    metrics["specificity"] = float(np.mean(metrics["spec_class"]))
+    metrics["acc_class"] = ((tp + tn) / np.clip(tp + tn + fp + fn, 1, None)).tolist()
+    metrics["acc_macro"] = float(np.mean(metrics["acc_class"]))
+    metrics["acc_micro"] = float((tp + tn).sum() / max(1.0, (tp + tn + fp + fn).sum()))
+    return metrics
+
+
 def make_dirs(dir_name):
     if not os.path.exists(dir_name):
         os.makedirs(dir_name, exist_ok=True)

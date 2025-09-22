@@ -101,10 +101,11 @@ class PointGroup(nn.Module):
         if not self.training:
             center_pred = coord + bias_pred
             center_pred /= self.voxel_size
+            seg_logits = logit_pred.detach() # for sem seg validation
             logit_pred = F.softmax(logit_pred, dim=-1)
             segment_pred = torch.max(logit_pred, 1)[1]  # [n]
             # cluster
-            mask = (
+            mask = ( # points predicted to be not in `segment_ignore_index`
                 ~torch.concat(
                     [
                         (segment_pred == index).unsqueeze(-1)
@@ -117,6 +118,7 @@ class PointGroup(nn.Module):
             )
 
             if mask.sum() == 0:
+                # all points are to be ignored
                 proposals_idx = torch.zeros(0).int()
                 proposals_offset = torch.zeros(1).int()
             else:
@@ -176,4 +178,5 @@ class PointGroup(nn.Module):
             return_dict["pred_scores"] = pred_scores
             return_dict["pred_masks"] = pred_masks
             return_dict["pred_classes"] = pred_classes
+            return_dict["seg_logits"] = seg_logits
         return return_dict

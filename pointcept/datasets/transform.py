@@ -51,6 +51,52 @@ def index_operator(data_dict, index, duplicate=False):
         return data_dict_
 
 
+def reorient_np(vol, src_ornt, trg_ornt, spacing=None):
+    """numpy-based reorientation
+    vol: np.ndarray, [H, W, L]
+    src_ornt: Tuple[char], original orientation, e.g. ('R', 'A', 'S')
+    trg_ornt: Tuple[char], target orientation, e.g. ('L', 'P', 'S')
+    spacing: float[3] = None, voxel spacing along each axis, in original axis order.
+    """
+    src_ornt = tuple(s.upper() for s in src_ornt)
+    trg_ornt = tuple(s.upper() for s in trg_ornt)
+    if src_ornt == trg_ornt:
+        if spacing is None:
+            return vol
+        return vol, spacing
+
+    opposites = {'L': 'R', 'R': 'L', 'P': 'A', 'A': 'P', 'I': 'S', 'S': 'I'}
+    # Find axis mapping and flip requirements
+    axis_order = []
+    flip_flags = []
+
+    for _t in trg_ornt:
+        # Find which source axis corresponds to this target direction
+        for src_axis, _s in enumerate(src_ornt):
+            if _s == _t:
+                # Same direction - no flip needed
+                axis_order.append(src_axis)
+                flip_flags.append(False)
+                break
+            elif _s == opposites[_t]:
+                # Opposite direction - flip needed
+                axis_order.append(src_axis)
+                flip_flags.append(True)
+                break
+
+    # Apply axis permutation
+    result = np.transpose(vol, axis_order)
+
+    # Apply flips where needed
+    for axis, flip in enumerate(flip_flags):
+        if flip:
+            result = np.flip(result, axis=axis)
+
+    if spacing is None:
+        return result
+    return result, tuple(spacing[axis] for axis in axis_order)
+
+
 @TRANSFORMS.register_module()
 class Collect(object):
     def __init__(self, keys, offset_keys_dict=None, **kwargs):
@@ -1179,6 +1225,134 @@ class InstanceParser(object):
         data_dict["instance_centroid"] = centroid
         data_dict["bbox"] = bbox
         return data_dict
+
+
+@TRANSFORMS.register_module()
+class CTIntensityVariation(object):
+    def __init__(self,
+                 intensity_shift_range=(-50, 50),  # HU units shift
+                 intensity_scale_range=(0.95, 1.05),  # multiplicative scaling
+                 gamma_range=(0.9, 1.1),  # gamma correction
+                 p=0.8):
+        """
+        CT Intensity/Density variation for point clouds derived from CT scans.
+
+        Args:
+            intensity_shift_range: Additive shift in HU units (simulates different scanner calibration)
+            intensity_scale_range: Multiplicative scaling (simulates different scanner gain)
+            gamma_range: Gamma correction range (simulates different reconstruction kernels)
+            p: Probability of applying the transform
+        """
+        self.intensity_shift_range = intensity_shift_range
+        self.intensity_scale_range = intensity_scale_range
+        self.gamma_range = gamma_range
+        self.p = p
+
+    def __call__(self, data_dict):
+        if "strength" in data_dict.keys() and np.random.rand() < self.p:
+            intensity = data_dict["strength"].copy()
+
+            # Apply additive shift (simulates scanner calibration differences)
+            if self.intensity_shift_range is not None:
+                shift = np.random.uniform(
+                    self.intensity_shift_range[0],
+                    self.intensity_shift_range[1]
+                )
+                intensity += shift
+
+            # Apply multiplicative scaling (simulates scanner gain differences)
+            if self.intensity_scale_range is not None:
+                scale = np.random.uniform(
+                    self.intensity_scale_range[0],
+                    self.intensity_scale_range[1]
+                )
+                intensity *= scale
+
+            # Apply gamma correction (simulates different reconstruction kernels)
+            if self.gamma_range is not None:
+                gamma = np.random.uniform(self.gamma_range[0], self.gamma_range[1])
+                # Normalize to [0,1], apply gamma, then scale back
+                intensity_min, intensity_max = intensity.min(), intensity.max()
+                if intensity_max > intensity_min:  # avoid division by zero
+                    intensity_norm = (intensity - intensity_min) / (intensity_max - intensity_min)
+                    intensity_norm = np.power(intensity_norm, gamma)
+                    intensity = intensity_norm * (intensity_max - intensity_min) + intensity_min
+
+            data_dict["strength"] = intensity
+
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class CTDensityNoise(object):
+    def __init__(self,
+                 noise_std=10,  # Standard deviation in HU units
+                 p=0.5):
+        """
+        Add Gaussian noise to CT intensity values (simulates scanner noise).
+
+        Args:
+            noise_std: Standard deviation of Gaussian noise in HU units
+            p: Probability of applying the transform
+        """
+        self.noise_std = noise_std
+        self.p = p
+
+    def __call__(self, data_dict):
+        if "strength" in data_dict.keys() and np.random.rand() < self.p:
+            noise = np.random.normal(
+                0, self.noise_std, data_dict["strength"].shape
+            ).astype(data_dict["strength"].dtype)
+            data_dict["strength"] += noise
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class NormalizeIntensity(object):
+    def __init__(self, min_hu=-1000, max_hu=1000, target_range=(0, 1)):
+        """
+        Args:
+            min_hu: Minimum HU value to clip to
+            max_hu: Maximum HU value to clip to
+            target_range: Output range (0,1) or (-1,1)
+        """
+        self.min_hu = min_hu
+        self.max_hu = max_hu
+        self.target_range = target_range
+
+    def __call__(self, data_dict):
+        if "strength" in data_dict.keys():
+            intensity = np.clip(data_dict["strength"], self.min_hu, self.max_hu)
+            # Normalize to [0,1]
+            intensity = (intensity - self.min_hu) / (self.max_hu - self.min_hu)
+            # Scale to target range
+            if self.target_range != (0, 1):
+                intensity = intensity * (self.target_range[1] - self.target_range[0]) + self.target_range[0]
+            data_dict["strength"] = intensity
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class SamplePoint:
+    """randomly sample a fix number of points from a volume"""
+    def __init__(self, npoints):
+        """
+        npoints: int, sample how many points from a volume
+        keys: List[str]: apply sampling to what keys in the data dict
+        """
+        self.npoints = npoints
+
+    def __call__(self, data_dict):
+        n = data_dict["coord"].shape[0]
+        if n >= self.npoints:
+            idx = np.random.choice(n, self.npoints, replace=False)
+        elif n < self.npoints:
+            idx = np.concatenate([
+                np.random.permutation(n),
+                np.random.choice(n, self.npoints - n, replace=True)
+            ])
+
+        return index_operator(data_dict, idx)
 
 
 class Compose(object):

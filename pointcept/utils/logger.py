@@ -7,7 +7,7 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
-import logging
+import logging, sys
 import torch
 import torch.distributed as dist
 
@@ -33,7 +33,8 @@ class _ColorfulFormatter(logging.Formatter):
         return prefix + " " + log
 
 
-def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color=False):
+def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color=False,
+               fmt="[%(asctime)s %(levelname)s %(filename)s line %(lineno)d %(process)d] %(message)s"):
     """Initialize and get a logger by name.
 
     If the logger has not been initialized, this method will initialize the
@@ -69,8 +70,18 @@ def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color
 
     logger.propagate = False
 
-    stream_handler = logging.StreamHandler()
-    handlers = [stream_handler]
+    # stream_handler = logging.StreamHandler()
+    # handlers = [stream_handler]
+    handlers = []
+    # terminal output to stdout: debug, info
+    h = logging.StreamHandler(sys.stdout)
+    h.setLevel(logging.DEBUG)
+    h.addFilter(lambda record: record.levelno <= logging.INFO)
+    handlers.append(h)
+    # terminal output to stderr: warning, error, critical
+    h = logging.StreamHandler(sys.stderr)
+    h.setLevel(logging.WARNING)
+    handlers.append(h)
 
     if dist.is_available() and dist.is_initialized():
         rank = dist.get_rank()
@@ -83,11 +94,10 @@ def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color
         # provide an interface to change the file mode to the default
         # behaviour.
         file_handler = logging.FileHandler(log_file, file_mode)
+        file_handler.setLevel(log_level)
         handlers.append(file_handler)
 
-    plain_formatter = logging.Formatter(
-        "[%(asctime)s %(levelname)s %(filename)s line %(lineno)d %(process)d] %(message)s"
-    )
+    plain_formatter = logging.Formatter(fmt)
     if color:
         formatter = _ColorfulFormatter(
             colored("[%(asctime)s %(name)s]: ", "green") + "%(message)s",
@@ -98,7 +108,7 @@ def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color
         formatter = plain_formatter
     for handler in handlers:
         handler.setFormatter(formatter)
-        handler.setLevel(log_level)
+        # handler.setLevel(log_level)
         logger.addHandler(handler)
 
     if rank == 0:
