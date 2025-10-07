@@ -12,6 +12,10 @@ cuDNN 9
 PyTorch 2.5.0+cu124
 torchvision 0.20.0+cu124
 
+%environment
+
+export PYTHONPATH=.
+
 %post
 
 # required by UTS iHPC

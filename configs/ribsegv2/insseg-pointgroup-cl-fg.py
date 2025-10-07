@@ -10,7 +10,7 @@ segment_ignore_index = (-1, 0)
 # dataset settings
 dataset_type = "Ribsegv2DatasetFG"
 data_root = "data/ribsegv2"
-bg_ratio = 0.1
+bg_ratio = None
 # bg_ratio_rel_fg = 1
 
 
@@ -34,16 +34,19 @@ data = dict(
                 p=0.5
             ),
             dict(type='NormalizeIntensity', min_hu=-1000, max_hu=1000),
-            dict(type="CenterShift", apply_z=True),
-            dict(
-                type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.5
-            ),
+            # dict(
+            #     type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.5
+            # ),
+            dict(type="SamplePoint", npoints=15000),
+            dict(type="Copy", keys_dict={"instance": "origin_instance"}), # before `InstanceParser` which rearrange instance ids
+            dict(type="MatchRibSkeleton"),
+            dict(type="CenterShift", apply_z=True, also_to=["matched_skeleton"]),
             # dict(type="RandomRotateTargetAngle", angle=(1/2, 1, 3/2), center=[0, 0, 0], axis='z', p=0.75),
             # dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             # dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="x", p=0.5),
             # dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="y", p=0.5),
-            dict(type="RandomScale", scale=[0.9, 1.1]),
-            dict(type="RandomShift", shift=((-0.2, 0.2), (-0.2, 0.2), (-0.2, 0.2))),
+            dict(type="RandomScale", scale=[0.9, 1.1], also_to=["matched_skeleton"]),
+            dict(type="RandomShift", shift=((-20.2, 20.2), (-20.2, 20.2), (-20.2, 20.2)), also_to=["matched_skeleton"]),
             # dict(type="RandomFlip", p=0.5),
             # dict(type="RandomJitter", sigma=0.005, clip=0.02),
             # dict(type="ElasticDistortion", distortion_params=[[0.2, 0.4], [0.8, 1.6]]),
@@ -59,14 +62,15 @@ data = dict(
                 mode="train",
                 return_grid_coord=True,
             ),
+            dict(type="CenterShift", apply_z=False, also_to=["matched_skeleton"]),
             # dict(type="SphereCrop", point_max=15000, mode="random"),
-            dict(type="SamplePoint", npoints=15000),
             # dict(type="NormalizeColor"),
             dict(
                 type="InstanceParser",
                 segment_ignore_index=segment_ignore_index,
                 instance_ignore_index=-1,
             ),
+            dict(type="Copy", keys_dict={"matched_skeleton": "instance_centroid"}), # after `InstanceParser`
             dict(type="ToTensor"),
             dict(
                 type="Collect",
@@ -92,7 +96,7 @@ data = dict(
         data_root=data_root,
         transform=[
             dict(type='NormalizeIntensity', min_hu=-1000, max_hu=1000),
-            dict(type="CenterShift", apply_z=True),
+            dict(type="SamplePoint", npoints=15000), # before `origin_instance` copy, otherwise shape mismatch
             dict(
                 type="Copy",
                 keys_dict={
@@ -101,6 +105,8 @@ data = dict(
                     "instance": "origin_instance",
                 },
             ),
+            dict(type="MatchRibSkeleton"),
+            dict(type="CenterShift", apply_z=True, also_to=["matched_skeleton"]),
             dict(
                 type="GridSample",
                 grid_size=0.02,
@@ -109,14 +115,14 @@ data = dict(
                 return_grid_coord=True,
             ),
             # dict(type="SphereCrop", point_max=1000000, mode='center'),
-            dict(type="SamplePoint", npoints=15000),
-            dict(type="CenterShift", apply_z=False),
+            dict(type="CenterShift", apply_z=False, also_to=["matched_skeleton"]),
             # dict(type="NormalizeColor"),
             dict(
                 type="InstanceParser",
                 segment_ignore_index=segment_ignore_index,
                 instance_ignore_index=-1,
             ),
+            dict(type="Copy", keys_dict={"matched_skeleton": "instance_centroid"}), # after `InstanceParser`
             dict(type="ToTensor"),
             dict(
                 type="Collect",
@@ -146,7 +152,7 @@ data = dict(
         data_root=data_root,
         transform=[
             dict(type='NormalizeIntensity', min_hu=-1000, max_hu=1000),
-            dict(type="CenterShift", apply_z=True),
+            dict(type="SamplePoint", npoints=15000), # before `origin_instance` copy, otherwise shape mismatch
             dict(
                 type="Copy",
                 keys_dict={
@@ -155,6 +161,8 @@ data = dict(
                     "instance": "origin_instance",
                 },
             ),
+            dict(type="MatchRibSkeleton"),
+            dict(type="CenterShift", apply_z=True, also_to=["matched_skeleton"]),
             dict(
                 type="GridSample",
                 grid_size=0.02,
@@ -163,14 +171,15 @@ data = dict(
                 return_grid_coord=True,
             ),
             # dict(type="SphereCrop", point_max=1000000, mode='center'),
-            dict(type="SamplePoint", npoints=1000000),
-            dict(type="CenterShift", apply_z=False),
-            dict(type="NormalizeColor"),
+            # dict(type="SamplePoint", npoints=1000000),
+            dict(type="CenterShift", apply_z=False, also_to=["matched_skeleton"]),
+            # dict(type="NormalizeColor"),
             dict(
                 type="InstanceParser",
                 segment_ignore_index=segment_ignore_index,
                 instance_ignore_index=-1,
             ),
+            dict(type="Copy", keys_dict={"matched_skeleton": "instance_centroid"}), # after `InstanceParser`
             dict(type="ToTensor"),
             dict(
                 type="Collect",

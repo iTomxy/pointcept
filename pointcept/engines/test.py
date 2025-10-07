@@ -27,6 +27,7 @@ from pointcept.utils.misc import (
     intersection_and_union,
     intersection_and_union_gpu,
     make_dirs,
+    confusion_matrix, calc_cm_metrics
 )
 
 try:
@@ -356,6 +357,88 @@ class SemSegTester(TesterBase):
     @staticmethod
     def collate_fn(batch):
         return batch
+
+
+@TESTERS.register_module()
+class SemSegTester2(SemSegTester):
+    """(28 Sept 2025, iTom) adajusted simpler"""
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start SemSegTester2 Evaluation >>>>>>>>>>>>>>>>")
+
+        # batch_time = AverageMeter()
+        tp_meter = AverageMeter()
+        tn_meter = AverageMeter()
+        fp_meter = AverageMeter()
+        fn_meter = AverageMeter()
+        self.model.eval()
+
+        # save_path = os.path.join(self.cfg.save_path, "result")
+        # make_dirs(save_path)
+        comm.synchronize()
+        record = {}
+        # fragment inference
+        for idx, data_dict in enumerate(self.test_loader):
+            # start = time.time()
+            data_dict = data_dict[0]  # current assume batch size is 1
+            for key in data_dict.keys():
+                if isinstance(data_dict[key], torch.Tensor):
+                    data_dict[key] = data_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.model(data_dict)
+            # fragment_list = data_dict.pop("fragment_list")
+            pred = output_dict["seg_logits"].max(1)[1]#.cpu().numpy()
+            segment = data_dict.pop("segment")#.cpu().numpy()
+            data_name = data_dict.pop("name")
+            # pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
+            tp, tn, fp, fn = confusion_matrix(
+                pred,
+                segment,
+                self.cfg.data.num_classes,
+                self.cfg.data.ignore_index,
+            )
+            tp, tn, fp, fn = tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy()
+            tp_meter.update(tp)
+            tn_meter.update(tn)
+            fp_meter.update(fp)
+            fn_meter.update(fn)
+            record[data_name] = dict(
+                # intersection=intersection, union=union, target=target
+                tp=tp, tn=tn, fp=fp, fn=fn
+            )
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+
+        if comm.is_main_process():
+            record = {}
+            for _ in range(len(record_sync)):
+                r = record_sync.pop()
+                record.update(r)
+                del r
+            # intersection = np.sum(
+            #     [meters["intersection"] for _, meters in record.items()], axis=0
+            # )
+            # union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
+            # target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
+            tp = np.sum([meters["tp"] for _, meters in record.items()], axis=0)
+            tn = np.sum([meters["tn"] for _, meters in record.items()], axis=0)
+            fp = np.sum([meters["fp"] for _, meters in record.items()], axis=0)
+            fn = np.sum([meters["fn"] for _, meters in record.items()], axis=0)
+
+            # if self.cfg.data.test.type == "S3DISDataset":
+            #     torch.save(
+            #         dict(intersection=intersection, union=union, target=target),
+            #         os.path.join(save_path, f"{self.test_loader.dataset.split}.pth"),
+            #     )
+
+            metrics = calc_cm_metrics(tp, tn, fp, fn,
+                self.cfg.data.num_classes, self.cfg.data.ignore_index)
+            for k, v in metrics.items():
+                logger.info("{}: {}".format(k, v))
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
 
 
 @TESTERS.register_module()
@@ -901,6 +984,7 @@ class InsSegTester(TesterBase):
         instance_ignore_index,
         **kwargs,
     ):
+        self.save_pred = kwargs.pop("save_pred", False)
         super().__init__(**kwargs)
         self.segment_ignore_index = segment_ignore_index
         self.instance_ignore_index = instance_ignore_index
@@ -917,7 +1001,7 @@ class InsSegTester(TesterBase):
     def test(self):
         assert self.test_loader.batch_size == 1
         logger = get_root_logger()
-        logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        logger.info(">>>>>>>>>>>>>>>> Start InsSegTester Evaluation >>>>>>>>>>>>>>>>")
 
         batch_time = AverageMeter()
 
@@ -936,6 +1020,12 @@ class InsSegTester(TesterBase):
                 instance = data_dict["origin_instance"]
 
                 if "origin_coord" in data_dict.keys():
+                    # (7 Oct 2025, iTom) BUG: Since `GridSample` uses `index_operator`,
+                    # which re-indexes, thus re-orders, points, this 1-nn (closest)
+                    # point matching seems aiming at recovering the point order.
+                    # However, since `coord` is distorted in data augmentation,
+                    # while `origin_coord` is NOT, they are NOT in the same coordinate
+                    # space anymore, so this matching does NOT work as expected.
                     reverse, _ = pointops.knn_query(
                         1,
                         data_dict["coord"].float(),
@@ -971,6 +1061,14 @@ class InsSegTester(TesterBase):
                     data_name,
                 )
 
+            if self.save_pred:
+                save_dir = os.path.join(self.cfg.save_path, "pred")
+                os.makedirs(save_dir, exist_ok=True)
+                save_dict = {k: v.cpu().numpy() for k, v in output_dict.items() if isinstance(v, torch.Tensor)}
+                save_dict.update({k: v.cpu().numpy() for k, v in data_dict.items() if isinstance(v, torch.Tensor)})
+                save_dict.update({"gt_instances": gt_instances, "pred_instance": pred_instance})
+                np.savez_compressed(os.path.join(save_dir, "InsSegTester-{}.npz".format(data_name)), **save_dict)
+
         comm.synchronize()
         scenes_sync = comm.gather(scenes, dst=0)
         scenes = [scene for scenes_ in scenes_sync for scene in scenes_]
@@ -992,7 +1090,7 @@ class InsSegTester(TesterBase):
                     idx=i, name=label_name, AP=ap, AP50=ap_50, AP25=ap_25
                 )
             )
-        logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        logger.info("<<<<<<<<<<<<<<<<< End InsSegTester Evaluation <<<<<<<<<<<<<<<<<")
 
     def write_scannetpp_results(
         self,
@@ -1033,6 +1131,7 @@ class InsSegTester(TesterBase):
         result_file.close()
 
     def associate_instances(self, pred, segment, instance):
+        """find matched gt & pred (i.e. with positive intersection)"""
         segment = segment.cpu().numpy()
         instance = instance.cpu().numpy()
         void_mask = np.in1d(segment, self.segment_ignore_index)
@@ -1044,7 +1143,7 @@ class InsSegTester(TesterBase):
         )
         assert pred["pred_masks"].shape[1] == segment.shape[0] == instance.shape[0]
         # get gt instances
-        gt_instances = dict()
+        gt_instances = dict() # {class_name: []}
         for i in range(self.cfg.data.num_classes):
             if i not in self.segment_ignore_index:
                 gt_instances[self.cfg.data.names[i]] = []
@@ -1315,3 +1414,105 @@ class InsSegTester(TesterBase):
     def collate_fn(batch):
         # Restrict to bs 1
         return batch[0]
+
+
+@TESTERS.register_module()
+class InsSegTester2(InsSegTester):
+    """(7 Oct 2025, iTom) modified from InsSegTester
+    1. use `segment` and `instance` instead of the `origin_*` variant
+    2. don't reverse with `pointops.knn_query`
+    """
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start InsSegTester Evaluation >>>>>>>>>>>>>>>>")
+
+        batch_time = AverageMeter()
+
+        self.model.eval()
+        scenes = []
+
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_name = data_dict.pop("name")
+            for key in data_dict.keys():
+                if isinstance(data_dict[key], torch.Tensor):
+                    data_dict[key] = data_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.model(data_dict)
+
+            segment = data_dict["segment"]#["origin_segment"]
+            instance = data_dict["instance"]#["origin_instance"]
+
+            # if "origin_coord" in data_dict.keys():
+            #     # (7 Oct 2025, iTom) BUG: Since `GridSample` uses `index_operator`,
+            #     # which re-indexes, thus re-orders, points, this 1-nn (closest)
+            #     # point matching seems aiming at recovering the point order.
+            #     # However, since `coord` is distorted in data augmentation,
+            #     # while `origin_coord` is NOT, they are NOT in the same coordinate
+            #     # space anymore, so this matching does NOT work as expected.
+            #     reverse, _ = pointops.knn_query(
+            #         1,
+            #         data_dict["coord"].float(),
+            #         data_dict["offset"].int(),
+            #         data_dict["origin_coord"].float(),
+            #         data_dict["origin_offset"].int(),
+            #     )
+            #     reverse = reverse.cpu().flatten().long()
+            #     output_dict["pred_masks"] = output_dict["pred_masks"][:, reverse]
+            #     segment = data_dict["origin_segment"]
+            #     instance = data_dict["origin_instance"]
+
+            gt_instances, pred_instance = self.associate_instances(
+                output_dict, segment, instance
+            )
+
+            scenes.append(dict(gt=gt_instances, pred=pred_instance))
+            batch_time.update(time.time() - start)
+            logger.info(
+                "Test: {} [{}/{}] "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) ".format(
+                    data_name,
+                    idx + 1,
+                    len(self.test_loader),
+                    batch_time=batch_time,
+                )
+            )
+            if self.cfg.data.test.type == "ScanNetPPDataset":
+                self.write_scannetpp_results(
+                    output_dict["pred_scores"],
+                    output_dict["pred_masks"],
+                    output_dict["pred_classes"],
+                    data_name,
+                )
+
+            if self.save_pred:
+                save_dir = os.path.join(self.cfg.save_path, "pred")
+                os.makedirs(save_dir, exist_ok=True)
+                save_dict = {k: v.cpu().numpy() for k, v in output_dict.items() if isinstance(v, torch.Tensor)}
+                save_dict.update({k: v.cpu().numpy() for k, v in data_dict.items() if isinstance(v, torch.Tensor)})
+                save_dict.update({"gt_instances": gt_instances, "pred_instance": pred_instance})
+                np.savez_compressed(os.path.join(save_dir, "InsSegTester-{}.npz".format(data_name)), **save_dict)
+
+        comm.synchronize()
+        scenes_sync = comm.gather(scenes, dst=0)
+        scenes = [scene for scenes_ in scenes_sync for scene in scenes_]
+        ap_scores = self.evaluate_matches(scenes)
+        all_ap = ap_scores["all_ap"]
+        all_ap_50 = ap_scores["all_ap_50%"]
+        all_ap_25 = ap_scores["all_ap_25%"]
+        logger.info(
+            "Val result: mAP/AP50/AP25 {:.4f}/{:.4f}/{:.4f}.".format(
+                all_ap, all_ap_50, all_ap_25
+            )
+        )
+        for i, label_name in enumerate(self.valid_class_names):
+            ap = ap_scores["classes"][label_name]["ap"]
+            ap_50 = ap_scores["classes"][label_name]["ap50%"]
+            ap_25 = ap_scores["classes"][label_name]["ap25%"]
+            logger.info(
+                "Class_{idx}-{name} Result: AP/AP50/AP25 {AP:.4f}/{AP50:.4f}/{AP25:.4f}".format(
+                    idx=i, name=label_name, AP=ap, AP50=ap_50, AP25=ap_25
+                )
+            )
+        logger.info("<<<<<<<<<<<<<<<<< End InsSegTester Evaluation <<<<<<<<<<<<<<<<<")

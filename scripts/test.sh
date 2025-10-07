@@ -12,8 +12,9 @@ WEIGHT=model_best
 NUM_GPU=None
 NUM_MACHINE=1
 DIST_URL="auto"
+OPTIONS=""
 
-while getopts "p:d:c:n:w:g:m:" opt; do
+while getopts "p:d:c:n:w:g:m:o:" opt; do
   case $opt in
     p)
       PYTHON=$OPTARG
@@ -35,6 +36,9 @@ while getopts "p:d:c:n:w:g:m:" opt; do
       ;;
     m)
       NUM_MACHINE=$OPTARG
+      ;;
+    o)
+      OPTIONS="$OPTIONS $OPTARG"
       ;;
     \?)
       echo "Invalid option: -$OPTARG"
@@ -89,4 +93,4 @@ $PYTHON -u tools/$TEST_CODE \
   --num-machines "$NUM_MACHINE" \
   --machine-rank ${SLURM_NODEID:-0} \
   --dist-url ${DIST_URL} \
-  --options save_path="$EXP_DIR" weight="${MODEL_DIR}"/"${WEIGHT}".pth
+  --options save_path="$EXP_DIR" weight="${MODEL_DIR}"/"${WEIGHT}".pth $OPTIONS

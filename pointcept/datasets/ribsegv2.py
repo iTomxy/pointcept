@@ -4,8 +4,8 @@ import nibabel as nib
 import torch
 from .builder import DATASETS
 from .defaults import DefaultDataset
-from .transform import reorient_np
-from pointcept.utils.cache import shared_dict
+from .transform import reorient_3dgrid, reorient_points
+# from pointcept.utils.cache import shared_dict
 
 """
 instance segmentation of ribs.
@@ -37,8 +37,9 @@ class Ribsegv2Dataset(DefaultDataset):
 
     def get_data(self, idx):
         volume_id = self.data_list[idx % len(self.data_list)]
-        image, label = self.load_volume(volume_id)
+        image, label, cl = self.load_volume(volume_id)
         sieve_mask = self.sieve(image, label)
+        # assert np.any(sieve_mask), "empty sieve_mask: {}".format(volume_id)
         segment = (label > 0).astype(np.int8)
         instance = np.where(label > 0, label, IGNORE_INDEX).astype(np.int8)
         data_dict = {
@@ -46,6 +47,7 @@ class Ribsegv2Dataset(DefaultDataset):
             "strength": image[sieve_mask][:, np.newaxis], # See ./transform.py/index_operator/"index_valid_keys".
             "segment": segment[sieve_mask],
             "instance": instance[sieve_mask],
+            "skeleton": cl.astype(np.float32), # [c=24, n_cl_pt=500, 3]
         }
         # sampling = self.sample_index(data_dict["coord"].shape[0])
         # data_dict = {k: v[sampling] for k, v in data_dict.items()}
@@ -58,15 +60,20 @@ class Ribsegv2Dataset(DefaultDataset):
     def load_volume(self, volume_id):
         fn_img = os.path.join(self.data_root, "image", "RibFrac{}-image.nii.gz".format(volume_id))
         fn_lab = os.path.join(self.data_root, "label", "RibFrac{}-rib-seg.nii.gz".format(volume_id))
+        fn_cl = os.path.join(self.data_root, "centreline", "RibFrac{}.npz".format(volume_id))
         image_vol = nib.load(fn_img) # [H, W, L]
         label_vol = nib.load(fn_lab) # [H, W, L], in {0, ..., 24}
+        cl = np.load(fn_cl)["cl"] # [c=24, n_cl_pt=500, 3]
         ori = nib.aff2axcodes(image_vol.affine)
         assert nib.aff2axcodes(label_vol.affine) == ori
         # spacing = tuple(map(float, image_vol.header.get_zooms())) # spacing in original axis order
-        # image, spacing = reorient_np(image_vol.get_fdata().astype(np.float32), ori, "LPS", spacing)
-        image = reorient_np(image_vol.get_fdata().astype(np.float32), ori, "LPS")
-        label = reorient_np(label_vol.get_fdata().astype(np.uint8), ori, "LPS")
-        return image, label#, spacing
+        image = image_vol.get_fdata().astype(np.float32)
+        shape = image.shape
+        # image, spacing = reorient_3dgrid(image, ori, "LPS", spacing)
+        image = reorient_3dgrid(image, ori, "LPS")
+        label = reorient_3dgrid(label_vol.get_fdata().astype(np.uint8), ori, "LPS")
+        cl = reorient_points(cl, ori, "LPS", ((0, shape[0]-1), (0, shape[1]-1), (0, shape[2]-1)))
+        return image, label, cl#, spacing
 
     # def sample_index(self, n):
     #     """randomly sample self.npoints indices within `n`"""

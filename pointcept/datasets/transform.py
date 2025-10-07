@@ -12,6 +12,7 @@ import scipy.ndimage
 import scipy.interpolate
 import scipy.stats
 import numpy as np
+from scipy.spatial import cKDTree
 import torch
 import copy
 from collections.abc import Sequence, Mapping
@@ -22,8 +23,12 @@ TRANSFORMS = Registry("transforms")
 
 
 def index_operator(data_dict, index, duplicate=False):
-    # index selection operator for keys in "index_valid_keys"
-    # custom these keys by "Update" transform in config
+    """index selection operator for keys in `index_valid_keys`
+    custom these keys by "Update" transform in config
+
+    NOTE: This affects the point order! This can in turns affect
+    for example the gt & predicted instance association in InsSeg testing.
+    """
     if "index_valid_keys" not in data_dict:
         data_dict["index_valid_keys"] = [
             "coord",
@@ -51,8 +56,8 @@ def index_operator(data_dict, index, duplicate=False):
         return data_dict_
 
 
-def reorient_np(vol, src_ornt, trg_ornt, spacing=None):
-    """numpy-based reorientation
+def reorient_3dgrid(vol, src_ornt, trg_ornt, spacing=None):
+    """numpy-based reorientation of 3D voxel grid volume
     vol: np.ndarray, [H, W, L]
     src_ornt: Tuple[char], original orientation, e.g. ('R', 'A', 'S')
     trg_ornt: Tuple[char], target orientation, e.g. ('L', 'P', 'S')
@@ -95,6 +100,89 @@ def reorient_np(vol, src_ornt, trg_ornt, spacing=None):
     if spacing is None:
         return result
     return result, tuple(spacing[axis] for axis in axis_order)
+
+
+def reorient_points(points, src_ornt, trg_ornt, axes_range):
+    """reorient a set of 3D points
+    Input:
+        points: [..., 3], numpy.ndarray
+        src_ornt: Tuple[char], original orientation, e.g. ('R', 'A', 'S')
+        trg_ornt: Tuple[char], target orientation, e.g. ('L', 'P', 'S')
+        axes_range: [(x1, x2), (y1, y2), (z1, z2)], range of point coordinates
+            along each axis, all inclusive, in original axis order.
+    Output:
+        result: [..., 3], numpy.ndarray, reoriented points
+    """
+    src_ornt = tuple(s.upper() for s in src_ornt)
+    trg_ornt = tuple(s.upper() for s in trg_ornt)
+    if src_ornt == trg_ornt:
+        return points
+
+    # Define opposite directions
+    opposites = {'L': 'R', 'R': 'L', 'P': 'A', 'A': 'P', 'I': 'S', 'S': 'I'}
+    # Find axis mapping and flip requirements
+    axis_order = []
+    flip_flags = []
+    for _t in trg_ornt:
+        # Find which source axis corresponds to this target direction
+        for src_axis, _s in enumerate(src_ornt):
+            if _s == _t:
+                # Same direction - no flip needed
+                axis_order.append(src_axis)
+                flip_flags.append(False)
+                break
+            elif _s == opposites[_t]:
+                # Opposite direction - flip needed
+                axis_order.append(src_axis)
+                flip_flags.append(True)
+                break
+
+    # re-order axes
+    result = points[..., axis_order]
+    axes_range = [axes_range[i] for i in axis_order]
+    # flip axes
+    for coord_axis, (flip, (_min, _max)) in enumerate(zip(flip_flags, axes_range)):
+        if flip:
+            result[..., coord_axis] = _min + _max - result[..., coord_axis]
+
+    return result
+
+
+def match_skeleton(points, skeleton):
+    """match each point with its nearest skeleton (e.g. centre line of blood vessel) point
+    Input:
+        points: float[n, 3]
+        skeleton: float[m, 3], points on the skeleton
+    Output:
+        matched_points: float[n, 3], nearest skeleton point for each input point
+    """
+    tree = cKDTree(skeleton)
+    dist, idx = tree.query(points, k=1)
+    return skeleton[idx]
+
+
+def adjust_spacing(points, old_spacing, new_spacing):
+    """(7 Oct 2025, iTom) NOT TESTED
+    Adjust point coordinates for new spacing.
+
+    Args:
+        points: [n, 3] array of point coordinates
+        old_spacing: [3] array of old spacing (z, y, x) or (h, w, l)
+        new_spacing: [3] array of new spacing
+
+    Returns:
+        adjusted_points: [n, 3] array with adjusted coordinates
+    """
+    old_spacing = np.array(old_spacing)
+    new_spacing = np.array(new_spacing)
+
+    # Scale factor from old to new spacing
+    scale_factor = old_spacing / new_spacing
+
+    # Apply scaling
+    adjusted_points = points * scale_factor
+
+    return adjusted_points
 
 
 @TRANSFORMS.register_module()
@@ -214,8 +302,9 @@ class PositiveShift(object):
 
 @TRANSFORMS.register_module()
 class CenterShift(object):
-    def __init__(self, apply_z=True):
+    def __init__(self, apply_z=True, also_to=[]):
         self.apply_z = apply_z
+        self.also_to = also_to # also apply to these keys
 
     def __call__(self, data_dict):
         if "coord" in data_dict.keys():
@@ -226,13 +315,18 @@ class CenterShift(object):
             else:
                 shift = [(x_min + x_max) / 2, (y_min + y_max) / 2, 0]
             data_dict["coord"] -= shift
+            for key in self.also_to:
+                if key in data_dict.keys():
+                    data_dict[key] -= shift
+
         return data_dict
 
 
 @TRANSFORMS.register_module()
 class RandomShift(object):
-    def __init__(self, shift=((-0.2, 0.2), (-0.2, 0.2), (0, 0))):
+    def __init__(self, shift=((-0.2, 0.2), (-0.2, 0.2), (0, 0)), also_to=[]):
         self.shift = shift
+        self.also_to = also_to # also apply to these keys
 
     def __call__(self, data_dict):
         if "coord" in data_dict.keys():
@@ -240,6 +334,9 @@ class RandomShift(object):
             shift_y = np.random.uniform(self.shift[1][0], self.shift[1][1])
             shift_z = np.random.uniform(self.shift[2][0], self.shift[2][1])
             data_dict["coord"] += [shift_x, shift_y, shift_z]
+            for key in self.also_to:
+                if key in data_dict.keys():
+                    data_dict[key] += [shift_x, shift_y, shift_z]
         return data_dict
 
 
@@ -359,9 +456,10 @@ class RandomRotateTargetAngle(object):
 
 @TRANSFORMS.register_module()
 class RandomScale(object):
-    def __init__(self, scale=None, anisotropic=False):
+    def __init__(self, scale=None, anisotropic=False, also_to=[]):
         self.scale = scale if scale is not None else [0.95, 1.05]
         self.anisotropic = anisotropic
+        self.also_to = also_to # also apply to these keys
 
     def __call__(self, data_dict):
         if "coord" in data_dict.keys():
@@ -369,6 +467,9 @@ class RandomScale(object):
                 self.scale[0], self.scale[1], 3 if self.anisotropic else 1
             )
             data_dict["coord"] *= scale
+            for key in self.also_to:
+                if key in data_dict.keys():
+                    data_dict[key] *= scale
         return data_dict
 
 
@@ -872,6 +973,12 @@ class GridSample(object):
         min_coord = grid_coord.min(0)
         grid_coord -= min_coord
         scaled_coord -= min_coord
+
+        # (29 Sept 2025, iTom) do NOT shift & scale matched_skeleton here
+        #     cuz it should match `coord` to infer correct `bias_gt` in loss calculation.
+        # if "matched_skeleton" in data_dict:
+        #     data_dict["matched_skeleton"] = data_dict["matched_skeleton"] / np.array(self.grid_size) - min_coord
+
         min_coord = min_coord * np.array(self.grid_size)
         key = self.hash(grid_coord)
         idx_sort = np.argsort(key)
@@ -891,7 +998,12 @@ class GridSample(object):
                 mask = np.zeros_like(data_dict["segment"]).astype(bool)
                 mask[data_dict["sampled_index"]] = True
                 data_dict["sampled_index"] = np.where(mask[idx_unique])[0]
+
             data_dict = index_operator(data_dict, idx_unique)
+            # (29 Sept 2025, iTom) also apply to matched_skeleton
+            if "matched_skeleton" in data_dict:
+                data_dict["matched_skeleton"] = data_dict["matched_skeleton"][idx_unique]
+
             if self.return_inverse:
                 data_dict["inverse"] = np.zeros_like(inverse)
                 data_dict["inverse"][idx_sort] = inverse
@@ -1224,6 +1336,38 @@ class InstanceParser(object):
         data_dict["instance"] = instance
         data_dict["instance_centroid"] = centroid
         data_dict["bbox"] = bbox
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class MatchRibSkeleton:
+    """Match rib instance points to their closest skeleton/centreline point.
+    This relies on the original instance IDs before InstanceParser to correctly
+    associate points with their respective skeletons. So copy `instance` to
+    `origin_instance` BEFORE InstanceParser, which rearranges instances' ID.
+    """
+    def __call__(self, data_dict):
+        """
+        skeleton: float[n_cls, n_skeleton_pt, 3]. Background(0) is NOT included,
+            so skeleton[0] is the centreline of rib1.
+        origin_instance: int[npt], original instance ids (i.e. rib1-rib24) before InstanceParser.
+        """
+        assert "skeleton" in data_dict.keys()
+        assert "origin_instance" in data_dict.keys(), \
+            "Copy `instance` to `origin_instance` in advance before `InstanceParser."
+        matched_skeleton = np.zeros_like(data_dict["coord"], dtype=np.float32) - 1.0
+        for instance_id in np.unique(data_dict["origin_instance"]):
+            if instance_id <= 0:
+                continue
+            mask = data_dict["origin_instance"] == instance_id
+            if np.sum(mask) == 0:
+                continue
+            coord = data_dict["coord"][mask]
+            skeleton = data_dict["skeleton"][instance_id - 1]  # rib1
+            m_sk = match_skeleton(coord, skeleton)
+            matched_skeleton[mask] = m_sk
+
+        data_dict["matched_skeleton"] = matched_skeleton
         return data_dict
 
 

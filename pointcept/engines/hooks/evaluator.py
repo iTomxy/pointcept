@@ -205,10 +205,14 @@ class SemSegEvaluator(HookBase):
         metrics = calc_cm_metrics(tp, tn, fp, fn,
             self.trainer.cfg.data.num_classes, self.trainer.cfg.data.ignore_index)
         self.trainer.logger.info(
-            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
-                # m_iou, m_acc, all_acc
-                metrics["iou"], metrics["acc_macro"], metrics["acc_micro"]
-            )
+            # "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
+            #     # m_iou, m_acc, all_acc
+            #     metrics["iou"], metrics["acc_macro"], metrics["acc_micro"]
+            # )
+            "Val result: " + ", ".join([
+                "{} {:.4f}".format(k, v)
+                for k, v in metrics.items() if isinstance(v, float)
+            ])
         )
         # for i in range(self.trainer.cfg.data.num_classes):
         #     self.trainer.logger.info(
@@ -689,3 +693,81 @@ class InsSegEvaluator(HookBase):
                 "AP50": float(all_ap_50),
                 "AP25": float(all_ap_25),
             }))
+
+
+@HOOKS.register_module()
+class SkeletonRegEvaluator(HookBase):
+    def __init__(self, instance_ignore_index=-1):
+        self.instance_ignore_index = instance_ignore_index
+
+    def before_train(self):
+        if comm.is_main_process():
+            self.json_logger = get_logger(
+                "skreg_json_val",
+                log_file=os.path.join(self.trainer.cfg.save_path, "skreg_val.json"),
+                file_mode="a",
+                fmt="%(message)s"
+            )
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Skeleton Reg Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        l1_loss = []
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.trainer.model(input_dict)
+            loss = output_dict["loss"]
+            bias_pred = output_dict["bias_pred"] # [bs*npt, 3]
+            sk_pred = input_dict["coord"] + bias_pred
+            sk_gt = input_dict["instance_centroid"] # [bs*npt, 3]
+
+            sk_pred = sk_pred.view(-1, self.trainer.cfg.npoints, 3)
+            sk_gt = sk_gt.view(-1, self.trainer.cfg.npoints, 3)
+            instance = input_dict["instance"].view(-1, self.trainer.cfg.npoints) # [bs, npt]
+            mask = (instance != self.instance_ignore_index).float()
+            sk_dist = torch.sum(torch.abs(sk_pred - sk_gt), dim=-1) # [bs, npt]
+            bias_l1_loss = torch.sum(sk_dist * mask, dim=-1) / (torch.sum(mask, dim=-1) + 1e-8) # [bs]
+            l1_loss.append(bias_l1_loss.cpu().numpy())
+            self.trainer.storage.put_scalar("val_loss", loss.item())
+            info = "Test: [{iter}/{max_iter}] ".format(
+                iter=i + 1, max_iter=len(self.trainer.val_loader)
+            )
+            self.trainer.logger.info(
+                info
+                + "Loss {loss:.4f} ".format(
+                    iter=i + 1, max_iter=len(self.trainer.val_loader), loss=loss.item()
+                )
+            )
+
+        loss_avg = self.trainer.storage.history("val_loss").avg
+        comm.synchronize()
+        l1_loss_sync = comm.gather(l1_loss, dst=0) # List[List[np.ndarray]]
+        l1_loss = np.asarray([l for batch in l1_loss_sync for l in batch]).flatten()
+        l1_loss_mean = np.mean(l1_loss)
+        l1_loss_std = np.std(l1_loss)
+        self.trainer.logger.info("Val L1 loss: {:.4f} +- {:.4f}".format(l1_loss_mean, l1_loss_std))
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
+            self.trainer.writer.add_scalar("val/l1", l1_loss_mean, current_epoch)
+
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        self.trainer.comm_info["current_metric_value"] = - l1_loss_mean  # save for saver, NEGative cuz smaller is better
+        self.trainer.comm_info["current_metric_name"] = "L1Loss"  # save for saver
+
+        # (21 Sept 2025, iTom) log to json file
+        if comm.is_main_process():
+            log = {"epoch": current_epoch, "loss": float(loss_avg), "l1": float(l1_loss_mean), "l1_std": float(l1_loss_std)}
+            self.json_logger.info(json.dumps(log))
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format("L1 loss", self.trainer.best_metric_value)
+        )

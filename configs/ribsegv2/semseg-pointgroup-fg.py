@@ -19,7 +19,7 @@ segment_ignore_index = (-1, 0)
 
 # model settings
 model = dict(
-    type="PG-v1m1",
+    type="PG-semseg",
     backbone=dict(
         type="SpUNet-v1m1",
         in_channels=1, # channels for features (e.g. HU) other than coord
@@ -41,7 +41,8 @@ model = dict(
 # scheduler settings
 epoch = 100
 eval_epoch = epoch
-optimizer = dict(type="SGD", lr=0.1, momentum=0.9, weight_decay=0.0001, nesterov=True)
+# optimizer = dict(type="SGD", lr=0.1, momentum=0.9, weight_decay=0.0001, nesterov=True)
+optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.0001)
 scheduler = dict(type="PolyLR")
 
 # dataset settings
@@ -193,7 +194,7 @@ data = dict(
                 return_grid_coord=True,
             ),
             # dict(type="SphereCrop", point_max=1000000, mode='center'),
-            dict(type="SamplePoint", npoints=1000000),
+            dict(type="SamplePoint", npoints=15000),
             dict(type="CenterShift", apply_z=False),
             # dict(type="NormalizeColor"),
             dict(
@@ -229,19 +230,17 @@ hooks = [
     dict(type="CheckpointLoader", keywords="module.", replacement="module."),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
-    dict(
-        type="InsSegEvaluator",
-        segment_ignore_index=segment_ignore_index,
-        instance_ignore_index=-1,
-    ),
+    # dict(
+    #     type="InsSegEvaluator",
+    #     segment_ignore_index=segment_ignore_index,
+    #     instance_ignore_index=-1,
+    # ),
+    dict(type="SemSegEvaluator", write_cls_iou=True),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="PreciseEvaluator", test_last=False),
 ]
 
 # Tester
 test = dict(
-    type="InsSegTester",
-    segment_ignore_index=segment_ignore_index,
-    instance_ignore_index=-1,
-    verbose=False,
+    type="SemSegTester2"
 )

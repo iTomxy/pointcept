@@ -15,7 +15,9 @@ outputs/
 **/*.out
 Dockerfile
 
-error.*.log
+*.log
 .ipynb_checkpoints
 tmp*.py
 tmp*.sh
+cumm/
+spconv/

@@ -16,6 +16,7 @@ from .oacnns import *
 
 # Semantic Segmentation
 from .context_aware_classifier import *
+from .dgcnn import *
 
 # Instance Segmentation
 from .point_group import *

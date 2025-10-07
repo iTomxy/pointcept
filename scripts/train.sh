@@ -14,9 +14,10 @@ RESUME=false
 NUM_GPU=None
 NUM_MACHINE=1
 DIST_URL="auto"
+OPTIONS=""
 
 
-while getopts "p:d:c:n:w:g:m:r:" opt; do
+while getopts "p:d:c:n:w:g:m:r:o:" opt; do
   case $opt in
     p)
       PYTHON=$OPTARG
@@ -41,6 +42,9 @@ while getopts "p:d:c:n:w:g:m:r:" opt; do
       ;;
     m)
       NUM_MACHINE=$OPTARG
+      ;;
+    o)
+      OPTIONS="$OPTIONS $OPTARG"
       ;;
     \?)
       echo "Invalid option: -$OPTARG"
@@ -102,7 +106,7 @@ then
     --num-machines "$NUM_MACHINE" \
     --machine-rank ${SLURM_NODEID:-0} \
     --dist-url ${DIST_URL} \
-    --options save_path="$EXP_DIR"
+    --options save_path="$EXP_DIR" $OPTIONS
 else
     $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE \
     --config-file "$CONFIG_DIR" \
@@ -110,5 +114,5 @@ else
     --num-machines "$NUM_MACHINE" \
     --machine-rank ${SLURM_NODEID:-0} \
     --dist-url ${DIST_URL} \
-    --options save_path="$EXP_DIR" resume="$RESUME" weight="$WEIGHT"
+    --options save_path="$EXP_DIR" resume="$RESUME" weight="$WEIGHT" $OPTIONS
 fi
