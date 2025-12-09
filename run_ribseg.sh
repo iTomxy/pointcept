@@ -9,16 +9,17 @@ dset=ribsegv2
 # cfg=insseg-pointgroup-cl-fg
 # cfg=semseg-pointgroup-fg
 # cfg=semseg-dgcnn
-cfg=clreg-dgcnn
+# cfg=clreg-dgcnn
+cfg=semseg-pt_v3m1_0_base-bin
 exp=${cfg}
 cfg_f=configs/$dset/${cfg}.py
 
 
-. scripts/train.sh -g 2 -d $dset -c $cfg -n $exp -p /opt/conda/bin/python \
+bash scripts/train.sh -g 2 -d $dset -c $cfg -n $exp -p /opt/conda/bin/python -r true \
     2> error.${0%.*}.log
 
 
-. scripts/test.sh -g 2 -d $dset -n $exp -p /opt/conda/bin/python \
+bash scripts/test.sh -g 1 -d $dset -c $cfg -n $exp -p /opt/conda/bin/python \
     -w model_best \
     2> error.${0%.*}.log
 

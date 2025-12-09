@@ -9,6 +9,8 @@ import os
 import warnings
 from collections import abc
 import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
 import torch
 from importlib import import_module
 
@@ -66,13 +68,26 @@ def intersection_and_union_gpu(output, target, k, ignore_index=-1):
 
 
 def confusion_matrix(pred, y, k, ignore_index=-1):
-    """Compute confusion matrix components (TP, TN, FP, FN) for multi-class segmentation.
-    Args:
+    """Compute confusion matrix (TP, TN, FP, FN) for multi-class classification/segmentation,
+    based on PyTorch tensors, can be used together with `torch.distributed.all_reduce` for distributed evaluation.
+    Related metrics include: IoU, dice, accuracy
+    Example:
+    ```python
+    background_cls = 0
+    for x, y in loader:
+        with torch.no_grad():
+            logits = model(x) # [B, C, H, W]
+        pred = logits.argmax(1) # [B, H, W]
+        tp, tn, fp, fn = confusion_matrix(pred, y, num_classes, background_cls)
+        if ddp_enabled:
+            dist.all_reduce(tp), dist.all_reduce(tn), dist.all_reduce(fp), dist.all_reduce(fn)
+    ```
+    Input:
         pred: prediction mask of shape [N] or [N, L] or [N, H, W], int
         y: ground-truth segmentation mask, same shape as pred
         k: int, #classes
         ignore_index: Union[int, List[int]] = -1, class ID/s to ignore in computation
-    Returns:
+    Output:
         tp: int[k], True Positive
         tn: int[k], True Negative
         fp: int[k], False Positive
@@ -80,13 +95,14 @@ def confusion_matrix(pred, y, k, ignore_index=-1):
     """
     assert pred.dim() in [1, 2, 3]
     assert pred.shape == y.shape
-    if isinstance(ignore_index, int):
-        ignore_index = [ignore_index]
+    assert k >= pred.max() and k >= y.max()
 
     pred = pred.view(-1)
     y = y.view(-1)
-    ignore_index = torch.tensor(ignore_index, device=pred.device, dtype=pred.dtype)
-    valid_mask = ~ torch.isin(y, ignore_index)
+    ignore_index = torch.tensor([ignore_index], dtype=pred.dtype).flatten().to(pred.device)
+    ignore_mask = torch.isin(y, ignore_index)
+    pred[ignore_mask] = -1  # set ignore_index to -1
+    valid_mask = ~ ignore_mask
     total_valid_pixels = valid_mask.sum().item()
 
     p_pred = torch.histc(pred[valid_mask], bins=k, min=0, max=k-1)
@@ -133,7 +149,39 @@ def calc_cm_metrics(tp, tn, fp, fn, class_set, ignore_cls=[]):
     metrics["acc_class"] = ((tp + tn) / np.clip(tp + tn + fp + fn, 1, None)).tolist()
     metrics["acc_macro"] = float(np.mean(metrics["acc_class"]))
     metrics["acc_micro"] = float((tp + tn).sum() / max(1.0, (tp + tn + fp + fn).sum()))
+
+    # these metrics should be within [0, 1]
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            assert -0.01 < v < 1.01, "Error value range of {}: {}".format(k, v)
+
     return metrics
+
+
+def vis_confusion_matrix(conf_matrix, classes_name, save_file, title='Normalized Confusion Matrix Heatmap'):
+    nc = len(classes_name)
+    fig, ax = plt.subplots(figsize=(nc + 4, nc + 4))
+
+    # Plot heatmap
+    fmt = ".2f" if np.issubdtype(conf_matrix.dtype, np.floating) else "d"
+    sns.heatmap(conf_matrix, annot=True, fmt=fmt, cmap="Blues",
+                xticklabels=classes_name, yticklabels=classes_name,
+                square=True, cbar=False, ax=ax)
+
+    for i in range(conf_matrix.shape[0]):
+        ax.add_patch(plt.Rectangle((i, i), 1, 1, fill=False, edgecolor='red', lw=2))
+
+    # Labels and title
+    ax.set_xlabel('Predicted Label')
+    ax.set_ylabel('True Label')
+    ax.set_title(title)
+
+    # Adjust layout
+    plt.tight_layout()
+
+    # Save figure with transparent background
+    plt.savefig(save_file, pad_inches=0.0, bbox_inches='tight')#, transparent=True)
+    plt.close(fig)
 
 
 def make_dirs(dir_name):

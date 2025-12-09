@@ -10,11 +10,12 @@ class_names = [
 num_classes = 2
 segment_ignore_index = (-1, 0)
 # dataset settings
-dataset_type = "Ribsegv2DatasetFG"
+dataset_type = "Ribsegv2DatasetFg"
 data_root = "data/ribsegv2"
 # bg_ratio = None
 # bg_ratio_rel_fg = 1
 npoints = 15000
+div_z = 3
 
 
 # model settings
@@ -45,6 +46,7 @@ data = dict(
     num_classes=num_classes,
     ignore_index=0, # background
     names=class_names,
+    num_classes_semseg=24+1, # bg + 24 ribs for segmantic seg
     train=dict(
         type=dataset_type,
         split="train",
@@ -67,6 +69,7 @@ data = dict(
             dict(type="SamplePoint", npoints=npoints),
             dict(type="Copy", keys_dict={"instance": "origin_instance"}), # before `InstanceParser` which rearrange instance ids
             dict(type="MatchRibSkeleton"),
+            dict(type="Respace", new_spacing=[0.5, 0.5, 0.5], keys=["coord", "matched_skeleton"]),
             dict(type="CenterShift", apply_z=True, also_to=["matched_skeleton"]),
             # dict(type="RandomRotateTargetAngle", angle=(1/2, 1, 3/2), center=[0, 0, 0], axis='z', p=0.75),
             # dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
@@ -82,13 +85,13 @@ data = dict(
             # dict(type="ChromaticJitter", p=0.95, std=0.05),
             # dict(type="HueSaturationTranslation", hue_max=0.2, saturation_max=0.2),
             # dict(type="RandomColorDrop", p=0.2, color_augment=0.0),
-            dict(
-                type="GridSample",
-                grid_size=0.02,
-                hash_type="fnv",
-                mode="train",
-                return_grid_coord=True,
-            ),
+            # dict(
+            #     type="GridSample",
+            #     grid_size=0.02,
+            #     hash_type="fnv",
+            #     mode="train",
+            #     return_grid_coord=True,
+            # ),
             dict(type="CenterShift", apply_z=False, also_to=["matched_skeleton"]),
             # dict(type="SphereCrop", point_max=15000, mode="random"),
             # dict(type="NormalizeColor"),
@@ -103,7 +106,7 @@ data = dict(
                 type="Collect",
                 keys=(
                     "coord",
-                    "grid_coord",
+                    # "grid_coord",
                     "segment",
                     "instance",
                     "instance_centroid",
@@ -116,6 +119,7 @@ data = dict(
         test_mode=False,
         # bg_ratio=bg_ratio,
         # bg_ratio_rel_fg=bg_ratio_rel_fg,
+        block_z=div_z,
     ),
     val=dict(
         type=dataset_type,
@@ -133,14 +137,15 @@ data = dict(
                 },
             ),
             dict(type="MatchRibSkeleton"),
+            dict(type="Respace", new_spacing=[0.5, 0.5, 0.5], keys=["coord", "matched_skeleton"]),
             dict(type="CenterShift", apply_z=True, also_to=["matched_skeleton"]),
-            dict(
-                type="GridSample",
-                grid_size=0.02,
-                hash_type="fnv",
-                mode="train",
-                return_grid_coord=True,
-            ),
+            # dict(
+            #     type="GridSample",
+            #     grid_size=0.02,
+            #     hash_type="fnv",
+            #     mode="train",
+            #     return_grid_coord=True,
+            # ),
             # dict(type="SphereCrop", point_max=1000000, mode='center'),
             dict(type="CenterShift", apply_z=False, also_to=["matched_skeleton"]),
             # dict(type="NormalizeColor"),
@@ -155,7 +160,7 @@ data = dict(
                 type="Collect",
                 keys=(
                     "coord",
-                    "grid_coord",
+                    # "grid_coord",
                     "segment",
                     "instance",
                     "origin_coord",
@@ -172,10 +177,11 @@ data = dict(
         test_mode=False,
         # bg_ratio=bg_ratio,
         # bg_ratio_rel_fg=bg_ratio_rel_fg,
+        block_z=div_z,
     ),
     test=dict(
         type=dataset_type,
-        split="val",
+        split="test",
         data_root=data_root,
         transform=[
             dict(type='NormalizeIntensity', min_hu=-1000, max_hu=1000),
@@ -189,14 +195,15 @@ data = dict(
                 },
             ),
             dict(type="MatchRibSkeleton"),
+            dict(type="Respace", new_spacing=[0.5, 0.5, 0.5], keys=["coord", "matched_skeleton"]),
             dict(type="CenterShift", apply_z=True, also_to=["matched_skeleton"]),
-            dict(
-                type="GridSample",
-                grid_size=0.02,
-                hash_type="fnv",
-                mode="train",
-                return_grid_coord=True,
-            ),
+            # dict(
+            #     type="GridSample",
+            #     grid_size=0.02,
+            #     hash_type="fnv",
+            #     mode="train",
+            #     return_grid_coord=True,
+            # ),
             # dict(type="SphereCrop", point_max=1000000, mode='center'),
             # dict(type="SamplePoint", npoints=1000000),
             dict(type="CenterShift", apply_z=False, also_to=["matched_skeleton"]),
@@ -212,7 +219,7 @@ data = dict(
                 type="Collect",
                 keys=(
                     "coord",
-                    "grid_coord",
+                    # "grid_coord",
                     "segment",
                     "instance",
                     "origin_coord",
@@ -221,6 +228,9 @@ data = dict(
                     "instance_centroid",
                     "bbox",
                     "name",
+                    "orientation",
+                    "label",
+                    # "spacing",
                 ),
                 # feat_keys=("color", "normal"),
                 feat_keys=("strength",),
@@ -233,26 +243,90 @@ data = dict(
     ),  # currently not available
 )
 
+# volume-wise test dataset
+data["test_volume"] = dict(
+    type="Ribsegv2VolumeLoader",
+    split="test",
+    dataset_cls="Ribsegv2VolumeFg",
+    data_root=data_root,
+    npoints=npoints,
+    transform=[
+            dict(type='NormalizeIntensity', min_hu=-1000, max_hu=1000),
+            # dict(type="SamplePoint", npoints=npoints), # before `origin_instance` copy, otherwise shape mismatch
+            dict(
+                type="Copy",
+                keys_dict={
+                    "coord": "origin_coord",
+                    "segment": "origin_segment",
+                    "instance": "origin_instance",
+                },
+            ),
+            dict(type="MatchRibSkeleton"),
+            dict(type="Respace", new_spacing=[0.5, 0.5, 0.5], keys=["coord", "matched_skeleton"]),
+            dict(type="CenterShift", apply_z=True, also_to=["matched_skeleton"]),
+            # dict(
+            #     type="GridSample",
+            #     grid_size=0.02,
+            #     hash_type="fnv",
+            #     mode="train",
+            #     return_grid_coord=True,
+            # ),
+            # dict(type="SphereCrop", point_max=1000000, mode='center'),
+            # dict(type="SamplePoint", npoints=1000000),
+            dict(type="CenterShift", apply_z=False, also_to=["matched_skeleton"]),
+            # dict(type="NormalizeColor"),
+            dict(
+                type="InstanceParser",
+                segment_ignore_index=segment_ignore_index,
+                instance_ignore_index=-1,
+            ),
+            dict(type="Copy", keys_dict={"matched_skeleton": "instance_centroid"}), # after `InstanceParser`
+            dict(type="ToTensor"),
+            dict(
+                type="Collect",
+                keys=(
+                    "coord",
+                    # "grid_coord",
+                    # "segment",
+                    "instance",
+                    "origin_coord",
+                    # "origin_segment",
+                    "origin_instance",
+                    "instance_centroid",
+                    # "bbox",
+                    # "name",
+                    # "orientation",
+                    "label",
+                    # "spacing",
+                ),
+                # feat_keys=("color", "normal"),
+                # feat_keys=("strength",),
+                # offset_keys_dict=dict(offset="coord", origin_offset="origin_coord"),
+            ),
+        ],
+)
+
 
 hooks = [
     dict(type="CheckpointLoader", keywords="module.", replacement="module."),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
     dict(type="SkeletonRegEvaluator", instance_ignore_index=-1),
-    dict(
-        type="InsSegEvaluator",
-        segment_ignore_index=segment_ignore_index,
-        instance_ignore_index=-1,
-    ),
+    # dict(
+    #     type="InsSegEvaluator",
+    #     segment_ignore_index=segment_ignore_index,
+    #     instance_ignore_index=-1,
+    # ),
     dict(type="CheckpointSaver", save_freq=None),
 ]
 
 
 # Tester
 # test = dict(type="SkeletonTester")
-test = dict(
-    type="InsSegTester2",
-    segment_ignore_index=segment_ignore_index,
-    instance_ignore_index=-1,
-    verbose=False,
-)
+# test = dict(
+#     type="InsSegTester2",
+#     segment_ignore_index=segment_ignore_index,
+#     instance_ignore_index=-1,
+#     verbose=False,
+# )
+test = dict(type="Ins2SemTester")

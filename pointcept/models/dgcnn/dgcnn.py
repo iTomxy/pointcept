@@ -620,6 +620,8 @@ class DGCNN_semseg(nn.Module):
 class DGCNN_clreg(nn.Module):
     """Centre Line REGression
     Input FG points, use oracle segment in grouping.
+    Updates:
+        - (7 Oct 2025) Integrate with insseg at test.
     """
 
     def __init__(self, npoints,
@@ -662,7 +664,11 @@ class DGCNN_clreg(nn.Module):
         """
         x = input_dict["coord"]
         npoints = self.npoints if npoints is None else npoints
-        x = x.view(-1, npoints, self.in_channels) # (bs*npt, in_channels) -> (bs, npt, in_channels)
+        try:
+            x = x.view(-1, npoints, self.in_channels) # (bs*npt, in_channels) -> (bs, npt, in_channels)
+        except Exception as e:
+            print(x.size())
+            raise e
         x = x.transpose(2, 1) # -> (bs, in_channels, #points)
         feat = self.backbone({"coord": x}) # (bs, feat_dims, npt)
         feat = feat.transpose(2, 1).contiguous() # -> [bs, npt, feat_dims]

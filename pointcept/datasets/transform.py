@@ -973,12 +973,6 @@ class GridSample(object):
         min_coord = grid_coord.min(0)
         grid_coord -= min_coord
         scaled_coord -= min_coord
-
-        # (29 Sept 2025, iTom) do NOT shift & scale matched_skeleton here
-        #     cuz it should match `coord` to infer correct `bias_gt` in loss calculation.
-        # if "matched_skeleton" in data_dict:
-        #     data_dict["matched_skeleton"] = data_dict["matched_skeleton"] / np.array(self.grid_size) - min_coord
-
         min_coord = min_coord * np.array(self.grid_size)
         key = self.hash(grid_coord)
         idx_sort = np.argsort(key)
@@ -1497,6 +1491,21 @@ class SamplePoint:
             ])
 
         return index_operator(data_dict, idx)
+
+
+@TRANSFORMS.register_module()
+class Respace:
+    """adjust spacing"""
+    def __init__(self, new_spacing, keys=["coord", "matched_skeleton"]):
+        self.new_spacing = new_spacing
+        self.keys = keys
+
+    def __call__(self, data_dict):
+        assert "spacing" in data_dict
+        for k in self.keys:
+            data_dict[k] = adjust_spacing(data_dict[k], data_dict["spacing"], self.new_spacing)
+
+        return data_dict
 
 
 class Compose(object):

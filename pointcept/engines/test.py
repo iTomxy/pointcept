@@ -10,6 +10,7 @@ from uuid import uuid4
 import os
 import time
 import numpy as np
+import sklearn
 from collections import OrderedDict
 import torch
 import torch.distributed as dist
@@ -27,8 +28,10 @@ from pointcept.utils.misc import (
     intersection_and_union,
     intersection_and_union_gpu,
     make_dirs,
-    confusion_matrix, calc_cm_metrics
+    confusion_matrix, calc_cm_metrics, vis_confusion_matrix,
 )
+from pointcept.utils import eval_cluster
+from pointcept.utils.ins2sem import relabel_ribs_anatomical
 
 try:
     import pointops
@@ -407,6 +410,7 @@ class SemSegTester2(SemSegTester):
                 # intersection=intersection, union=union, target=target
                 tp=tp, tn=tn, fp=fp, fn=fn
             )
+            print(idx, end='\r')
 
         logger.info("Syncing ...")
         comm.synchronize()
@@ -1062,12 +1066,12 @@ class InsSegTester(TesterBase):
                 )
 
             if self.save_pred:
-                save_dir = os.path.join(self.cfg.save_path, "pred")
+                save_dir = os.path.join(self.cfg.save_path, "result")
                 os.makedirs(save_dir, exist_ok=True)
                 save_dict = {k: v.cpu().numpy() for k, v in output_dict.items() if isinstance(v, torch.Tensor)}
                 save_dict.update({k: v.cpu().numpy() for k, v in data_dict.items() if isinstance(v, torch.Tensor)})
                 save_dict.update({"gt_instances": gt_instances, "pred_instance": pred_instance})
-                np.savez_compressed(os.path.join(save_dir, "InsSegTester-{}.npz".format(data_name)), **save_dict)
+                np.savez_compressed(os.path.join(save_dir, "InsSeg-{}.npz".format(data_name)), **save_dict)
 
         comm.synchronize()
         scenes_sync = comm.gather(scenes, dst=0)
@@ -1487,12 +1491,12 @@ class InsSegTester2(InsSegTester):
                 )
 
             if self.save_pred:
-                save_dir = os.path.join(self.cfg.save_path, "pred")
+                save_dir = os.path.join(self.cfg.save_path, "result")
                 os.makedirs(save_dir, exist_ok=True)
                 save_dict = {k: v.cpu().numpy() for k, v in output_dict.items() if isinstance(v, torch.Tensor)}
                 save_dict.update({k: v.cpu().numpy() for k, v in data_dict.items() if isinstance(v, torch.Tensor)})
                 save_dict.update({"gt_instances": gt_instances, "pred_instance": pred_instance})
-                np.savez_compressed(os.path.join(save_dir, "InsSegTester-{}.npz".format(data_name)), **save_dict)
+                np.savez_compressed(os.path.join(save_dir, "InsSeg2-{}.npz".format(data_name)), **save_dict)
 
         comm.synchronize()
         scenes_sync = comm.gather(scenes, dst=0)
@@ -1516,3 +1520,170 @@ class InsSegTester2(InsSegTester):
                 )
             )
         logger.info("<<<<<<<<<<<<<<<<< End InsSegTester Evaluation <<<<<<<<<<<<<<<<<")
+
+
+@TESTERS.register_module()
+class Ins2SemTester(SemSegTester2):
+    """(7 Oct 2025, iTom) convert instance id to rib class
+    Use `cfg.data.num_classes_semseg`, instead of `cfg.data.num_classes`, in metric calculation.
+    """
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Ins2SemTester Evaluation >>>>>>>>>>>>>>>>")
+
+        # tp_meter = AverageMeter()
+        # tn_meter = AverageMeter()
+        # fp_meter = AverageMeter()
+        # fn_meter = AverageMeter()
+        self.model.eval()
+
+        save_path = os.path.join(self.cfg.save_path, "result")
+        make_dirs(save_path)
+        comm.synchronize()
+        record = {}
+        for idx, data_dict in enumerate(self.test_loader):
+            # print(idx)
+            data_dict = data_dict[0]  # current assume batch size is 1
+            save_dict = {}
+            for key in data_dict.keys():
+                if isinstance(data_dict[key], torch.Tensor):
+                    save_dict[key] = data_dict[key].numpy()
+                    data_dict[key] = data_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.model(data_dict)
+            # pred = output_dict["seg_logits"].max(1)[1]#.cpu().numpy()
+            save_dict.update({k: v.cpu().numpy() for k, v in output_dict.items()})
+
+            # combine instance prediction
+            pred_ins = torch.zeros_like(output_dict["pred_masks"][0]) # [npt]
+            for i, m in enumerate(output_dict["pred_masks"]):
+                pred_ins[m > 0] = i + 1 # `+1` to avoid being 0
+            # map points back to voxel grids
+            pred_ins = pred_ins.cpu().numpy()
+            xyz = data_dict["origin_coord"].cpu().numpy().astype(int) # [npt, 3]
+            assert (xyz >= 0).all() # they are all voxel positions
+            _x, _y, _z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
+            shape = [_x.max() + 1, _y.max() + 1, _z.max() + 1]
+            pred_vol = np.zeros(shape, dtype=int)
+            pred_vol[_x, _y, _z] = pred_ins
+            # re-label: convert instance id to semantic class
+            pred_vol, _ = relabel_ribs_anatomical(pred_vol, data_dict["orientation"])
+            pred = pred_vol[_x, _y, _z] # -> [npt]
+            save_dict.update({"pred_semseg": pred})
+
+            # draw confusion matrix (based on instance & ins pred)
+            gt_ins = data_dict["instance"].cpu().numpy()
+            gt_ins -= gt_ins.min() # shift to 0-base
+            gt_nc = np.unique(gt_ins).shape[0]
+            nc = int(output_dict["pred_masks"].size(0))
+            pred_ins_ra = eval_cluster.reorder_assignment(
+                gt_ins, pred_ins - pred_ins.min(), gt_nc, nc+1)
+            cm = sklearn.metrics.confusion_matrix(gt_ins, pred_ins_ra)
+
+            # segment = data_dict.pop("segment")#.cpu().numpy()
+            label = data_dict.pop("label") # original multi-class label
+            data_name = data_dict.pop("name")
+            tp, tn, fp, fn = confusion_matrix(
+                # pred,
+                torch.from_numpy(pred).to(label.device),
+                # segment,
+                label,
+                # self.cfg.data.num_classes,
+                self.cfg.data.num_classes_semseg,
+                self.cfg.data.ignore_index,
+            )
+            tp, tn, fp, fn = tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy()
+            # tp_meter.update(tp)
+            # tn_meter.update(tn)
+            # fp_meter.update(fp)
+            # fn_meter.update(fn)
+            record[data_name] = dict(
+                tp=tp, tn=tn, fp=fp, fn=fn
+            )
+            res = calc_cm_metrics(tp, tn, fp, fn,
+                self.cfg.data.num_classes_semseg, self.cfg.data.ignore_index)
+            save_dict.update(res)
+
+            np.savez_compressed(os.path.join(save_path, "Ins2Sem-{}.npz".format(data_name)), **save_dict)
+            # save confusion matrix visualisation
+            vis_confusion_matrix(cm, [str(i) for i in range(max(gt_nc, nc))], os.path.join(
+                save_path, "cm-{}.png".format(data_name)), "{}: dice {:.4f}".format(data_name, res["dice"]))
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+
+        if comm.is_main_process():
+            record = {}
+            for _ in range(len(record_sync)):
+                r = record_sync.pop()
+                record.update(r)
+                del r
+
+            tp = np.sum([meters["tp"] for _, meters in record.items()], axis=0)
+            tn = np.sum([meters["tn"] for _, meters in record.items()], axis=0)
+            fp = np.sum([meters["fp"] for _, meters in record.items()], axis=0)
+            fn = np.sum([meters["fn"] for _, meters in record.items()], axis=0)
+            metrics = calc_cm_metrics(tp, tn, fp, fn,
+                self.cfg.data.num_classes_semseg, self.cfg.data.ignore_index)
+                # self.cfg.data.num_classes, self.cfg.data.ignore_index)
+            for k, v in metrics.items():
+                logger.info("{}: {}".format(k, v))
+
+            with open(os.path.join(self.cfg.save_path, "test-Ins2SemTester.json"), "w") as f:
+                json.dump(metrics, f, indent=1)
+
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+
+@TESTERS.register_module()
+class SavePredVolumeTester(Ins2SemTester):
+    """just predict & save, no evaluation"""
+    def build_test_loader(self):
+        assert comm.get_world_size() == 1
+        return build_dataset(self.cfg.data.test_volume)
+
+    def test(self):
+        assert self.cfg.batch_size_test_per_gpu == 1, str(self.cfg.batch_size_test_per_gpu)
+        self.model.eval()
+        save_path = os.path.join(self.cfg.save_path, "pred_volume")
+        make_dirs(save_path)
+        for vol_dset in self.test_loader:
+            print(vol_dset.volume_id)
+            vol_loader = torch.utils.data.DataLoader(
+                vol_dset,
+                batch_size=self.cfg.batch_size_test_per_gpu,
+                shuffle=False,
+                num_workers=self.cfg.batch_size_test_per_gpu,
+                pin_memory=True,
+                sampler=None,
+                collate_fn=self.__class__.collate_fn
+            )
+            save_dict = {}
+            for idx, data_dict in enumerate(vol_loader):
+                data_dict = data_dict[0]  # current assume batch size is 1
+                for key in data_dict.keys():
+                    if key in ("coord", "origin_coord", "instance"):
+                        d = data_dict[key].numpy()
+                        if key not in save_dict:
+                            save_dict[key] = d
+                        else:
+                            save_dict[key] = np.concatenate([save_dict[key], d], axis=0)
+
+                    if isinstance(data_dict[key], torch.Tensor):
+                        data_dict[key] = data_dict[key].cuda(non_blocking=True)
+
+                with torch.no_grad():
+                    output_dict = self.model(data_dict)
+
+                for key in ["bias_pred"]:
+                    d = output_dict[key].cpu().numpy()
+                    if key not in save_dict:
+                        save_dict[key] = d
+                    else:
+                        save_dict[key] = np.concatenate([save_dict[key], d], axis=0)
+
+                print(idx, end='\r')
+
+            np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **save_dict)
