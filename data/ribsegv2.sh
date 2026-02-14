@@ -47,7 +47,16 @@ do
 done
 
 
+echo preprocessed image \& label
+dname=pt_preproc
+ln -s $src/$dname $dst/$dname
+
+
+echo link binary fg-bg prediction
+bp_p=$HOME/codes/tmp.ptcloud/log/ribsegv2/semseg-dgcnn-bin-rndapply/recon-3d-binpred
+ln -s `realpath $bp_p` $dst/binpred
+
+
 cd $dst
-p=`realpath $HOME/codes/tmp.ptcloud/ribsegv2/segmentation/data/ribsegv2`
-ln -s $p/ribsegv2-fg-stat.json
-ln -s $p/ribsegv2-statistics.json
+# ln -s `realpath $HOME/codes/ribsegv2/segmentation/data/ribsegv2/ribsegv2-fg-stat.json`
+ln -s `realpath $HOME/codes/ribsegv2/segmentation/data/ribsegv2/ribsegv2-statistics.json`

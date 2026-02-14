@@ -5,12 +5,7 @@ set -e
 # export CUDA_HOME=/usr/local/cuda-11.8
 
 dset=ribsegv2
-# cfg=insseg-pointgroup-v1m1-0-spunet-base
-# cfg=insseg-pointgroup-cl-fg
-# cfg=semseg-pointgroup-fg
-# cfg=semseg-dgcnn
-# cfg=clreg-dgcnn
-cfg=semseg-pt_v3m1_0_base-bin
+cfg=semseg-pt_v3m1_0_base
 exp=${cfg}
 cfg_f=configs/$dset/${cfg}.py
 
@@ -20,7 +15,7 @@ bash scripts/train.sh -g 2 -d $dset -c $cfg -n $exp -p /opt/conda/bin/python -r 
 
 
 bash scripts/test.sh -g 1 -d $dset -c $cfg -n $exp -p /opt/conda/bin/python \
-    -w model_best \
+    -w model_best -o test.save_pred=False \
     2> error.${0%.*}.log
 
 

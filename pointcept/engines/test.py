@@ -11,6 +11,7 @@ import os
 import time
 import numpy as np
 import sklearn
+import nibabel as nib
 from collections import OrderedDict
 import torch
 import torch.distributed as dist
@@ -29,6 +30,7 @@ from pointcept.utils.misc import (
     intersection_and_union_gpu,
     make_dirs,
     confusion_matrix, calc_cm_metrics, vis_confusion_matrix,
+    clswise_cm_metrics_dist, to_dict,
 )
 from pointcept.utils import eval_cluster
 from pointcept.utils.ins2sem import relabel_ribs_anatomical
@@ -79,6 +81,7 @@ class TesterBase:
         if os.path.isfile(self.cfg.weight):
             self.logger.info(f"Loading weight at: {self.cfg.weight}")
             checkpoint = torch.load(self.cfg.weight, weights_only=False)
+            self.ckpt_epoch = checkpoint.get("epoch", -1)
             weight = OrderedDict()
             for key, value in checkpoint["state_dict"].items():
                 if key.startswith("module."):
@@ -440,9 +443,134 @@ class SemSegTester2(SemSegTester):
 
             metrics = calc_cm_metrics(tp, tn, fp, fn,
                 self.cfg.data.num_classes, self.cfg.data.ignore_index)
+            with open(os.path.join(
+                self.cfg.save_path, "test-{}.json".format(self.__class__.__name__)
+            ), 'w') as f:
+                json.dump({
+                    "time": time.asctime(time.gmtime()),
+                    "metrics": metrics,
+                    # "args": self.cfg
+                }, f, indent=1)
             for k, v in metrics.items():
                 logger.info("{}: {}".format(k, v))
             logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+
+@TESTERS.register_module()
+class SemSegVolumeTester(TesterBase):
+    """(9 Jan 2026, iTom) volume-wise test"""
+    def __init__(self, cfg, save_pred, *args, **kwargs):
+        self.save_pred = save_pred
+        super().__init__(cfg, *args, **kwargs)
+
+    def build_test_loader(self):
+        return build_dataset(self.cfg.data.test)
+
+    def test(self):
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start SemSegVolumeTester Evaluation >>>>>>>>>>>>>>>>")
+        self.model.eval()
+        if self.save_pred:
+            save_path = os.path.join(self.cfg.save_path, "result")
+            make_dirs(save_path)
+
+        comm.synchronize()
+        record = {}
+        metrics_sum = None # accumulate class-wise metrics, then reduce at last in main process
+        for vol_dset in self.test_loader:
+            vol_loader = torch.utils.data.DataLoader(vol_dset, batch_size=self.cfg.batch_size_test, shuffle=False)
+            pred_dict = self.pred_volume(vol_loader)
+            if self.save_pred:
+                np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
+
+            pred = pred_dict["pred"]#.reshape(-1)
+            label = pred_dict["label"]#.reshape(-1)
+            tp, tn, fp, fn = confusion_matrix(
+                torch.LongTensor(pred).cuda(non_blocking=True),
+                torch.LongTensor(label).cuda(non_blocking=True),
+                self.cfg.data.num_classes,
+            )
+            m = clswise_cm_metrics_dist(tp, tn, fp, fn)
+            if metrics_sum is None:
+                metrics_sum = m
+            else:
+                for k in m.keys():
+                    metrics_sum[k]["sum"] += m[k]["sum"]
+                    metrics_sum[k]["count"] += m[k]["count"]
+
+            print(vol_dset.volume_id, end='\r')
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+        # Now reduce across all processes ONCE after processing all batches
+        if comm.get_world_size() > 1:
+            # pack everything into a list of tensors to reduce
+            tensors_to_reduce = []
+            for m in metrics_sum:
+                tensors_to_reduce.append(metrics_sum[m]["sum"])
+                tensors_to_reduce.append(metrics_sum[m]["count"])
+            # Reduce everything at once (Summing across GPUs)
+            for t in tensors_to_reduce:
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+        if comm.is_main_process():
+            metrics = {}
+            for k, d in metrics_sum.items():
+                _sum = d["sum"]
+                _count = d["count"]
+                _clswise = (_sum / torch.clamp(_count, min=1))
+                _valid = torch.ones_like(_clswise)
+                _valid[self.cfg.data.bg_class] = 0
+                metrics[k] = _clswise[_valid > 0].mean().item()
+                metrics[k+"_class"] = _clswise.cpu().numpy()
+
+            with open(os.path.join(
+                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
+            ), 'w') as f:
+                json.dump({
+                    "time": time.asctime(time.gmtime()),
+                    "epoch": self.ckpt_epoch,
+                    "metrics": metrics,
+                    "args": to_dict(self.cfg),
+                }, f, indent=1)
+            for k, v in metrics.items():
+                logger.info("{}: {}".format(k, v))
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+    def pred_volume(self, vol_loader):
+        """calculate the prediction 3D voxel grid
+        Default value is -1 (not predicted voxels, should be ignored).
+        """
+        pred_list, label_list, index_list, coord_list = [], [], [], []
+        # Num points for each batch (batch size = 1)
+        # Record this cuz GridSample makes each batch have different npt,
+        # so the result cannot be stored in a [bs, npt, ...] format, but
+        # serialised to [npt_1 + ... + npt_k, ...] format. This can reconstruct
+        # each batch if wanted, e.g. in error analysing.
+        batch_npt = []
+        for i, batch in enumerate(vol_loader):
+            print(i, end='\r')
+            for key in batch.keys():
+                if isinstance(batch[key], torch.Tensor):
+                    # print(key, batch[key].size())
+                    batch[key] = batch[key].cuda(non_blocking=True)
+
+            with torch.no_grad():
+                output_dict = self.model(batch) # [bs, seg_num_all, #points]
+
+            pred_list.append(output_dict["seg_logits"].max(1)[1].cpu().numpy()) # already [#points]
+            label_list.append(batch["segment"].cpu().numpy()) # already [#points]
+            coord_list.append(batch["coord"].cpu().numpy()) # already [#points, 3]
+            index_list.append(batch["voxel_index"].cpu().numpy().astype(int)) # already [#points, 3]
+            batch_npt.append(batch["segment"].size(0))
+
+        return {
+            "pred": np.concatenate(pred_list), # [#points]
+            "label": np.concatenate(label_list), # [#points]
+            "coord": np.concatenate(coord_list), # [#points, 3+?]
+            "voxel_index": np.concatenate(index_list), # [#points, 3]
+            "batch_npt": np.asarray(batch_npt), # [#batches]
+        }
 
 
 @TESTERS.register_module()
