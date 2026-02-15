@@ -449,7 +449,7 @@ class SemSegTester2(SemSegTester):
                 json.dump({
                     "time": time.asctime(time.gmtime()),
                     "metrics": metrics,
-                    # "args": self.cfg
+                    "args": to_dict(self.cfg),
                 }, f, indent=1)
             for k, v in metrics.items():
                 logger.info("{}: {}".format(k, v))
@@ -475,7 +475,6 @@ class SemSegVolumeTester(TesterBase):
             make_dirs(save_path)
 
         comm.synchronize()
-        record = {}
         metrics_sum = None # accumulate class-wise metrics, then reduce at last in main process
         for vol_dset in self.test_loader:
             vol_loader = torch.utils.data.DataLoader(vol_dset, batch_size=self.cfg.batch_size_test, shuffle=False)
@@ -522,7 +521,7 @@ class SemSegVolumeTester(TesterBase):
                 _valid = torch.ones_like(_clswise)
                 _valid[self.cfg.data.bg_class] = 0
                 metrics[k] = _clswise[_valid > 0].mean().item()
-                metrics[k+"_class"] = _clswise.cpu().numpy()
+                metrics[k+"_class"] = _clswise.cpu().numpy().tolist()
 
             with open(os.path.join(
                 self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)

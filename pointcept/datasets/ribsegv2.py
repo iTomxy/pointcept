@@ -126,13 +126,13 @@ class Ribsegv2VolumeLoader:
         """kwargs: same as `Ribsegv2Volume` except for `volume_id`"""
         if kwargs.pop("test_all_incomplete", False):
             print("Test with all incomplete volumes from train, val and test set.")
-            self.id_list = list(INCOMPLETE_VOLS)
+            self.id_list = [x for x in list(INCOMPLETE_VOLS) if x not in IGNORE_VOLUMES]
         else:
             self.id_list = SPLITS[split]
 
         if kwargs.pop("add_trainval_incomplete", False):
             print("Test with test volumes (complete & incomplete) + incomplete volumes from train & val.")
-            self.id_list = list(set(self.id_list).union(INCOMPLETE_VOLS))
+            self.id_list = list(set(self.id_list).union(INCOMPLETE_VOLS).intersection(set(IGNORE_VOLUMES)))
 
         self.kwargs = kwargs
         self.dataset_cls = self.DATASET_CLASSES[dataset_cls]
