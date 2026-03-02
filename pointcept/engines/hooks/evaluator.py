@@ -15,7 +15,8 @@ from uuid import uuid4
 
 import pointcept.utils.comm as comm
 from pointcept.utils.logger import get_logger
-from pointcept.utils.misc import intersection_and_union_gpu, confusion_matrix, calc_cm_metrics
+from pointcept.utils.misc import intersection_and_union_gpu
+from pointcept.utils.eval_cm import confusion_matrix, calc_cm_metrics
 
 from .default import HookBase
 from .builder import HOOKS

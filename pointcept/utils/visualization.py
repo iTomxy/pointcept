@@ -13,6 +13,8 @@ except ImportError:
     o3d = None
 import numpy as np
 import torch
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 
 def to_numpy(x):
@@ -273,3 +275,29 @@ def bbox3d_points(point1, point2):
             all_edge_points.add((x, y, z))
 
     return np.array(list(all_edge_points))
+
+
+def vis_confusion_matrix(conf_matrix, classes_name, save_file, title='Normalized Confusion Matrix Heatmap'):
+    nc = len(classes_name)
+    fig, ax = plt.subplots(figsize=(nc + 4, nc + 4))
+
+    # Plot heatmap
+    fmt = ".2f" if np.issubdtype(conf_matrix.dtype, np.floating) else "d"
+    sns.heatmap(conf_matrix, annot=True, fmt=fmt, cmap="Blues",
+                xticklabels=classes_name, yticklabels=classes_name,
+                square=True, cbar=False, ax=ax)
+
+    for i in range(conf_matrix.shape[0]):
+        ax.add_patch(plt.Rectangle((i, i), 1, 1, fill=False, edgecolor='red', lw=2))
+
+    # Labels and title
+    ax.set_xlabel('Prediction')
+    ax.set_ylabel('Label')
+    ax.set_title(title)
+
+    # Adjust layout
+    plt.tight_layout()
+
+    # Save figure with transparent background
+    plt.savefig(save_file, pad_inches=0.0, bbox_inches='tight')#, transparent=True)
+    plt.close(fig)

@@ -10,7 +10,8 @@ import numbers
 import scipy
 import scipy.ndimage
 import scipy.interpolate
-import scipy.stats
+# import scipy.stats
+from scipy.ndimage import binary_dilation, generate_binary_structure
 import numpy as np
 import nibabel as nib
 from nibabel.orientations import axcodes2ornt, ornt_transform, apply_orientation
@@ -472,11 +473,12 @@ class CT2PointCloud:
     the raw UNnormalised HU value. But use it AFTER NormalizeIntensity, which
     can place the normalised intensity in `norm_intensity` and thus won't affect.
     """
-    def __init__(self, hu_thres, coi=None, keys=["segment"]):
+    def __init__(self, hu_thres, coi=None, keys=["segment", "strength"], dilate_connect=0):
         """
         hu_thres: float, HU threshold, only select voxels with intensity above
         coi: int|List[int] = None, classes of interest, if provided, only select voxels with class of interest
         keys: str|List[str] = ["segment"], apply the sieving to which field
+        dilate_connect: int = 0, dilation connectivity. If >0, dilate the binary sieving mask.
         """
         self.hu_thres = hu_thres
         if coi is not None:
@@ -485,6 +487,8 @@ class CT2PointCloud:
         if isinstance(keys, str):
             keys = [keys]
         self.keys = keys
+        # generate_binary_structure: `3` for 3D
+        self.struct_3d = generate_binary_structure(3, dilate_connect) if dilate_connect > 0 else None
 
     def sieve(self, data_dict):
         """
@@ -503,6 +507,10 @@ class CT2PointCloud:
             assert data_dict["sieve_mask"].shape == mask.shape, \
                 "Shape mismatch: data {} vs. sieve_mask {}".format(mask.shape, data_dict["sieve_mask"].shape)
             mask &= (1 == data_dict.pop("sieve_mask"))
+
+        if self.struct_3d is not None:
+            # dilate the mask to keep some surrounding non-bone voxels to help separate near-by bones
+            mask = binary_dilation(mask, structure=self.struct_3d)
 
         return mask
 
@@ -594,6 +602,75 @@ class CTIntensityVariation(object):
                     intensity = intensity_norm * (intensity_max - intensity_min) + intensity_min
 
             data_dict["strength"] = intensity
+
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class DropRibPoint:
+    """determinstic drop consecutive rib pairs from point cloud, used for controlled testing
+    Adapted from RandomDropRibPoint, but fix drop depth, truncation direction and single mode.
+    For the innest pair to drop, allow dropping only one rib of them.
+    Rib class ID order is hard-coded (top-down, S->I):
+    - left: 1 - 12
+    - right: 13 - 24
+    """
+    def __init__(self, keys, drop_depth, begin_from='i', single='', min_npt=789):
+        """
+        Args:
+            keys: List[str], fields (other than `label`) to apply on, e.g. coord, intensity.
+            drop_depth: int, in [1, 11], maximum depth (num of consecutive pairs) to drop
+            begin_from: str = 'i', in {'s', 'i'}, droppoing begins from which end along the IS-axis
+                - 's': drop superior rib pairs, keep inferior ones
+                - 'i': (opposite to 's')
+            single: str = '',  in {'', 'l', 'r'}, whether to keep one rib from the innest pair to drop, while only dropping the other one.
+                - '': drop the whole innest rib pair (keep none)
+                - 'l': only drop the right rib in the innest pair to drop, keep the left one
+                - 'r': drop left keep right
+            min_npt: int = 789, minimum #points of left points after truncation.
+                Skip the truncation if not enough points left.
+        """
+        if isinstance(keys, str):
+            keys = (keys,)
+        self.keys = set(keys)
+        if "segment" not in self.keys:
+            self.keys.add("segment")
+
+        rib_pairs = tuple((i, i+12) for i in range(1, 12+1))
+        drop_depth = int(drop_depth)
+        assert 1 <= drop_depth <= len(rib_pairs) - 1
+
+        single = single.lower()
+        assert single in ('', 'l', 'r'), "{}: Unsupport `single`: expect {}, got {}".format(
+            self.__class__.__name__, ('', 'l', 'r'), single
+        )
+
+        self.begin_from = begin_from.lower()
+        if 's' == self.begin_from: # from S (top) to I (bottom)
+            self.keep_ribs = np.asarray(rib_pairs[drop_depth: ])
+            if 'l' == single: # keep left
+                self.keep_ribs = np.append(self.keep_ribs, min(rib_pairs[drop_depth - 1])) # left <-> smaller id
+            elif 'r' == single: # keep right
+                self.keep_ribs = np.append(self.keep_ribs, max(rib_pairs[drop_depth - 1])) # right <-> bigger id
+        elif 'i' == self.begin_from: # from I (bottom) to S (top)
+            self.keep_ribs = np.asarray(rib_pairs[: - drop_depth])
+            if 'l' == single: # keep left
+                self.keep_ribs = np.append(self.keep_ribs, min(rib_pairs[- drop_depth]))
+            elif 'r' == single: # keep right
+                self.keep_ribs = np.append(self.keep_ribs, max(rib_pairs[- drop_depth]))
+        else:
+            raise ValueError("{}: Unsupport `begin_from`: expect {}, got {}".format(
+                    self.__class__.__name__, ('s', 'i'), self.begin_from
+                ))
+
+        self.keep_ribs = np.append(self.keep_ribs, 0) # keep BG points
+        self.min_npt = min_npt
+
+    def __call__(self, data_dict):
+        mask = np.isin(data_dict["segment"], self.keep_ribs)
+        if mask.sum() >= self.min_npt:
+            for k in self.keys:
+                data_dict[k] = data_dict[k][mask]
 
         return data_dict
 
@@ -1492,6 +1569,7 @@ class RandomDropRibPoint:
             rp = rp[: - n_drop]
 
         cs_keep = np.asarray(rp).flatten()
+        cs_keep = np.append(cs_keep, 0) # keep BG points
         if self.allow_single and random.random() < 0.5:
             cs_keep = np.append(cs_keep, random.choice(innest_pair))
 
@@ -1964,6 +2042,97 @@ class Transpose:
             else:
                 assert isinstance(data_dict[k], torch.Tensor)
                 data_dict[k] = torch.permute(data_dict[k], self.axes)
+
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class TruncateRibPoint:
+    """determinstic truncation specific for rib point cloud volume, used for controlled testing
+    Adapted from RandomTruncateRibPoint, but fix drop depth, truncation direction and position.
+    It truncates at rib upper/lower boundary (so that totally missing) or middle (so shape incomplete).
+    Rib class ID order is hard-coded (top-down, S->I):
+    - left: 1 - 12
+    - right: 13 - 24
+    Also, in RibSegV2 dataset, after converting coordinate to physical space (see ToPhysicalCoord),
+    greater z-axis value corresponds to superior (upper), and smaller to inferior (lower).
+    """
+    def __init__(self, keys, drop_depth, begin_from='i', pos='m', is_axis=2, min_npt=789):
+        """
+        Args:
+            keys: List[str], fields (other than `label`) to apply on, e.g. coord, intensity.
+            drop_depth: int, in [1, 11], maximum depth (num of consecutive pairs) to drop
+            begin_from: str = 'i', in {'s', 'i'}, droppoing begins from which end along the IS-axis
+                - 's': truncate superior part, keep inferior part
+                - 'i': (opposite to 's')
+            pos: str = 'm', in {'b', 'm'}, truncation position modes
+                - 'b': at boundary (top or bottom, dependent on truncation direction `begin_from`)
+                - 'm': at rib middle
+            p: float = 0.5, in [0, 1], application probability
+            is_axis: int = 2, which axis of `coord` is the position on the IS-axis (z-axis)
+                The default 2 assumes the first 3 channels of `coord` are coordinates and
+                the 3rd is its position on the IS-axis.
+            min_npt: int = 789, minimum #points of left points after truncation.
+                Skip the truncation if not enough points left.
+        """
+        if isinstance(keys, str):
+            keys = (keys,)
+        self.keys = set(keys)
+        if "segment" not in self.keys:
+            self.keys.add("segment")
+
+        rib_pairs = tuple((i, i+12) for i in range(1, 12+1))
+        drop_depth = int(drop_depth)
+        assert 1 <= drop_depth <= len(rib_pairs) - 1
+
+        self.begin_from = begin_from.lower()
+        if 's' == self.begin_from: # from S (top) to I (bottom)
+            self.anchor_rib_pair = np.asarray(rib_pairs[drop_depth - 1])
+            self.keep_ribs = np.asarray(rib_pairs[drop_depth: ]).flatten() # used for judgement in case anchor rib pair does not exist
+        elif 'i' == self.begin_from: # from I (bottom) to S (top)
+            self.anchor_rib_pair = np.asarray(rib_pairs[- drop_depth])
+            self.keep_ribs = np.asarray(rib_pairs[: - drop_depth]).flatten() # used for judgement in case anchor rib pair does not exist
+        else:
+            raise ValueError("{}: Unsupport `begin_from`: expect {}, got {}".format(
+                self.__class__.__name__, ('s', 'i'), self.begin_from
+            ))
+
+        self.keep_ribs = np.append(self.keep_ribs, 0) # keep BG points
+        self.pos = pos.lower()
+        valid_pos = (
+            'b', # truncate at rib boundary
+            'm', # at middle
+        )
+        assert self.pos in valid_pos, "{}: Unsupport `pos`: expect {}, got {}".format(
+            self.__class__.__name__, valid_pos, self.pos
+        )
+
+        self.is_axis = is_axis
+        self.min_npt = min_npt
+
+    def __call__(self, data_dict):
+        # assumes 1st 3 channels are xyz, and 3rd is the position on IS-axis (z-axis)
+        coord = data_dict["coord"]
+        anchor_mask = np.isin(data_dict["segment"], self.anchor_rib_pair)
+        if not anchor_mask.any(): # anchor rib does not exist
+            mask = np.isin(data_dict["segment"], self.keep_ribs)
+        else:
+            anchor_coord = coord[anchor_mask] # [m, 3+?]
+            if 'm' == self.pos:
+                cut_z = anchor_coord[:, self.is_axis].mean()
+            elif 's' == self.begin_from: # truncate Superior, keep Inferior
+                cut_z = anchor_coord[:, self.is_axis].min() # lower boundary to remove anchor rib
+            else: # truncate Inferior, keep Superior
+                cut_z = anchor_coord[:, self.is_axis].max() # upper boundary to remove anchor rib
+
+            if 's' == self.begin_from: # truncate Superior (larger), keep Inferior (smaller)
+                mask = coord[:, self.is_axis] < cut_z
+            else: # truncate Inferior, keep Superior
+                mask = coord[:, self.is_axis] > cut_z
+
+        if mask.sum() >= self.min_npt:
+            for k in self.keys:
+                data_dict[k] = data_dict[k][mask]
 
         return data_dict
 

@@ -13,7 +13,7 @@ outputs/
 .idea
 */.DS_Store
 **/*.out
-Dockerfile
+# Dockerfile
 
 *.log
 .ipynb_checkpoints

@@ -5,7 +5,7 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
-import os
+import os, math
 import warnings
 from collections import abc
 import numpy as np
@@ -69,156 +69,6 @@ def intersection_and_union_gpu(output, target, k, ignore_index=-1):
     return area_intersection, area_union, area_target
 
 
-def clswise_cm_metrics_dist(tp, tn, fp, fn):
-    """class-wise Confusion Matrix based metrics & counting
-    Args:
-        tp, tn, fp, fn: int[#classes], torch.LongTensor
-    Returns:
-        metrics: dict, {metric<str>: {
-            'sum': torch.FloatTensor[#classes],
-            'count': torch.FloatTensor[#classes]
-        }}. Invalid entries are set to 0 so that they are directly summable.
-    """
-    tp = tp.to(torch.float64)
-    tn = tn.to(torch.float64)
-    fp = fp.to(torch.float64)
-    fn = fn.to(torch.float64)
-    zero = torch.zeros_like(tp, dtype=torch.float64)
-    metrics = {}
-    # iou
-    denom = tp + fp + fn
-    metrics["iou"] = {
-        "sum": torch.where(denom > 0, tp / torch.clamp(denom, 1, None), zero),
-        "count": (denom > 0).to(torch.float64)
-    }
-    # dice = F1
-    denom = 2 * tp + fp + fn
-    metrics["dice"] = {
-        "sum": torch.where(denom > 0, (2 * tp) / torch.clamp(denom, 1, None), zero),
-        "count": (denom > 0).to(torch.float64)
-    }
-    # sensitivity = recall
-    denom = tp + fn
-    metrics["sensitivity"] = {
-        "sum": torch.where(denom > 0, tp / torch.clamp(denom, 1, None), zero),
-        "count": (denom > 0).to(torch.float64)
-    }
-    # precision
-    denom = tp + fp
-    metrics["precision"] = {
-        "sum": torch.where(denom > 0, tp / torch.clamp(denom, 1, None), zero),
-        "count": (denom > 0).to(torch.float64)
-    }
-    # specificity
-    denom = tn + fp
-    metrics["specificity"] = {
-        "sum": torch.where(denom > 0, tn / torch.clamp(denom, 1, None), zero),
-        "count": (denom > 0).to(torch.float64)
-    }
-    # accuracy
-    denom = tp + tn + fp + fn
-    metrics["accuracy"] = {
-        "sum": torch.where(denom > 0, (tp + tn) / torch.clamp(denom, 1, None), zero),
-        "count": (denom > 0).to(torch.float64)
-    }
-    return metrics
-
-
-def confusion_matrix(pred, y, num_classes, ignore_index=-1):
-    """Compute confusion matrix (TP, TN, FP, FN) for multi-class classification/segmentation,
-    based on PyTorch tensors, can be used together with `torch.distributed.all_reduce` for distributed evaluation.
-    Related metrics include: IoU, dice, accuracy
-    Example:
-    ```python
-    background_cls = 0
-    for x, y in loader:
-        with torch.no_grad():
-            logits = model(x) # [B, C, H, W]
-        pred = logits.argmax(1) # [B, H, W]
-        tp, tn, fp, fn = confusion_matrix(pred, y, num_classes, background_cls)
-        if ddp_enabled:
-            dist.all_reduce(tp), dist.all_reduce(tn), dist.all_reduce(fp), dist.all_reduce(fn)
-    ```
-    Input:
-        pred: prediction mask of shape [N] or [N, L] or [N, H, W], int
-        y: ground-truth segmentation mask, same shape as pred
-        num_classes: int, #classes
-        ignore_index: Union[int, List[int]] = -1, class ID/s to ignore in computation
-    Output:
-        tp: int[num_classes], True Positive
-        tn: int[num_classes], True Negative
-        fp: int[num_classes], False Positive
-        fn: int[num_classes], False Negative
-    """
-    assert pred.dim() in [1, 2, 3]
-    assert pred.shape == y.shape
-    assert num_classes >= pred.max() and num_classes >= y.max()
-
-    pred = pred.view(-1)
-    y = y.view(-1)
-    ignore_index = torch.tensor([ignore_index], dtype=pred.dtype).flatten().to(pred.device)
-    valid_mask = ~ torch.isin(y, ignore_index)
-    total_valid_pixels = valid_mask.sum().item()
-
-    p_pred = torch.histc(pred[valid_mask], bins=num_classes, min=0, max=num_classes-1)
-    p_y = torch.histc(y[valid_mask], bins=num_classes, min=0, max=num_classes-1)
-    correct_mask = (pred == y) & valid_mask
-
-    tp = torch.histc(y[correct_mask], bins=num_classes, min=0, max=num_classes-1)
-    fp = p_pred - tp
-    fn = p_y - tp
-    tn = total_valid_pixels - tp - fp - fn
-
-    return tp.long(), tn.long(), fp.long(), fn.long()
-
-
-def calc_cm_metrics(tp, tn, fp, fn, class_set, ignore_cls=[]):
-    """calculate Confusion Matrix based metrics
-    Input:
-        tp, tn, fp, fn: int[#classes]
-        class_set: int or List[int]
-            - int: #classes, the class ID set will be {0, ..., n_classes - 1}
-            - List[int]: ordered class ID set in the same order as tp, tn, fp & fn.
-                Can be useful in part segmentation?
-        ignore_cls: List[int] = [], classes to ignore at calculation, e.g. background
-    Output:
-        metrics: dict, {metric<str>: float}
-    """
-    ignore_cls = np.asarray([ignore_cls]).flatten()
-    class_set = np.arange(class_set) if isinstance(class_set, int) else np.asarray(class_set)
-    mask = ~ np.isin(class_set, ignore_cls)
-    metrics = {}
-
-    # class-wise: value of all classes are kept, including those to be ignored
-    metrics["iou_class"] = tp / np.clip(tp + fp + fn, 1, None)
-    metrics["dice_class"] = (2 * tp) / np.clip((2 * tp + fp + fn), 1, None)
-    metrics["sens_class"] = tp / np.clip(tp + fn, 1, None) # recall = sensitivity
-    metrics["prec_class"] = tp / np.clip(tp + fp, 1, None)
-    metrics["spec_class"] = tn / np.clip(tn + fp, 1, None) # specificity = recall for negative class
-    # metrics["f1_class"] = (2 * tp) / np.clip(2 * tp + fp + fn, 1, None)
-    metrics["acc_class"] = (tp + tn) / np.clip(tp + tn + fp + fn, 1, None)
-
-    # overall average: value of ignored classes are excluded
-    metrics["iou"] = float(np.mean(metrics["iou_class"][mask]))
-    metrics["dice"] = float(np.mean(metrics["dice_class"][mask]))
-    metrics["precision"] = float(np.mean(metrics["prec_class"][mask]))
-    metrics["sensitivity"] = float(np.mean(metrics["sens_class"][mask]))
-    metrics["specificity"] = float(np.mean(metrics["spec_class"][mask]))
-    # metrics["f1"] = float(np.mean(metrics["f1_class"][mask]))
-    metrics["acc_macro"] = float(np.mean(metrics["acc_class"][mask]))
-    metrics["acc_micro"] = float((tp + tn)[mask].sum() / max(1.0, (tp + tn + fp + fn)[mask].sum()))
-
-    for k, v in metrics.items():
-        if isinstance(v, float):
-            # these metrics should be within [0, 1]
-            assert -0.01 < v < 1.01, "Error value range of {}: {}".format(k, v)
-        else:
-            # class-wise list -> convert to list for json compatibility
-            metrics[k] = v.tolist()
-
-    return metrics
-
-
 def vis_confusion_matrix(conf_matrix, classes_name, save_file, title='Normalized Confusion Matrix Heatmap'):
     nc = len(classes_name)
     fig, ax = plt.subplots(figsize=(nc + 4, nc + 4))
@@ -243,6 +93,83 @@ def vis_confusion_matrix(conf_matrix, classes_name, save_file, title='Normalized
     # Save figure with transparent background
     plt.savefig(save_file, pad_inches=0.0, bbox_inches='tight')#, transparent=True)
     plt.close(fig)
+
+
+def calc_stat(lst, percentages=[], prec=None, scale=None):
+    """list of statistics: median, mean, standard error, min, max, percentiles
+    It can be useful when you want to know these statistics of a list and
+    dump them in a json log/string.
+    Input:
+        lst: list of number
+        percentages: List[float] = [], what percentiles (quantile) to cauculate
+        prec: int|None = None, round to which decimal place if it is an int
+        scale: int|float|None = None, scale the elements in `lst` if it is an int or float
+            Use it when `lst` contains normalised number (i.e. in [0, 1]) and you want to
+            present them in percentage (i.e. 0.xyz -> xy.z%)
+    """
+    if isinstance(scale, (int, float)):
+        lst = list(map(lambda x: scale * x, lst))
+
+    ret = {
+        "min": float(np.nanmin(lst)),
+        "max": float(np.nanmax(lst)),
+        "mean": float(np.nanmean(lst)),
+        "std": float(np.nanstd(lst)),
+        "median": float(np.nanmedian(lst))
+    }
+    if len(percentages) > 0:
+        percentages = [max(1e-7, min(p, 100 - 1e-7)) for p in percentages]
+        percentiles = np.nanpercentile(lst, percentages)
+        for ptage, ptile in zip(percentages, percentiles):
+            ret["p_{}".format(ptage)] = float(ptile)
+
+    if isinstance(prec, int):
+        ret = {k: round(v, prec) for k, v in ret.items()}
+
+    return ret
+
+
+def bootstrap_ci_mean_delta(delta, B=10000, alpha=0.05, seed=0):
+    """Calculate the confidence interval of mean of delta/difference of two variables using bootstrap method.
+    Args:
+        delta: float[], the difference of two variables for each sample
+        B: int = 10000, the number of bootstrap samples to draw
+        alpha: float = 0.05, the confidence level is 1 - alpha
+        seed: int = 0, random seed for reproducibility
+    Returns:
+        mean: float, the mean of delta
+        lo: float, the lower bound of confidence interval
+        hi: float, the upper bound of confidence interval
+    """
+    delta = np.asarray(delta, dtype=float)
+    n = delta.size
+    if 0 == n:
+        return {
+            'mean': float('nan'),
+            'lb': float('nan'),
+            'ub': float('nan'),
+        }
+    elif 1 == n:
+        return {
+            'mean': float(delta[0]),
+            'lb': None, # use None to indicate degenerate case
+            'ub': None,
+        }
+
+    rng = np.random.default_rng(seed)
+
+    boot = np.empty(B, dtype=float)
+    for b in range(B):
+        idx = rng.integers(0, n, size=n)
+        boot[b] = delta[idx].mean()
+
+    mean = delta.mean()
+    lo, hi = np.quantile(boot, [alpha/2, 1 - alpha/2])
+    return {
+        'mean': float(mean),
+        'lb': float(lo), # lower bound
+        'ub': float(hi), # higher bound
+    }
 
 
 def make_dirs(dir_name):

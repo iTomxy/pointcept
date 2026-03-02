@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 from .builder import DATASETS
 from .defaults import DefaultDataset
-from .transform import Compose, TRANSFORMS, reorient_3dgrid, reorient_points
+from .transform import Compose, reorient_points, determine_reorient
 # from pointcept.utils.cache import shared_dict
 
 """
@@ -13,8 +13,6 @@ instance segmentation of ribs.
 Adapted from ./scannet.py/ScanNetDataset
 """
 
-# ignore index for both class & instance (?)
-IGNORE_INDEX = -1
 IGNORE_VOLUMES = (452, 485, 490)
 IGNORE_VOLUMES += (
     # (17 Dec 2025, iTom) potential wrong label
@@ -126,14 +124,15 @@ class Ribsegv2VolumeLoader:
         """kwargs: same as `Ribsegv2Volume` except for `volume_id`"""
         if kwargs.pop("test_all_incomplete", False):
             print("Test with all incomplete volumes from train, val and test set.")
-            self.id_list = [x for x in list(INCOMPLETE_VOLS) if x not in IGNORE_VOLUMES]
+            id_list = list(INCOMPLETE_VOLS)
         else:
-            self.id_list = SPLITS[split]
+            id_list = SPLITS[split]
 
         if kwargs.pop("add_trainval_incomplete", False):
             print("Test with test volumes (complete & incomplete) + incomplete volumes from train & val.")
-            self.id_list = list(set(self.id_list).union(INCOMPLETE_VOLS).intersection(set(IGNORE_VOLUMES)))
+            id_list = list(set(id_list).union(INCOMPLETE_VOLS))
 
+        self.id_list = [x for x in id_list if x not in IGNORE_VOLUMES]
         self.kwargs = kwargs
         self.dataset_cls = self.DATASET_CLASSES[dataset_cls]
 
@@ -147,3 +146,75 @@ class Ribsegv2VolumeLoader:
     def __iter__(self):
         for vid in self.id_list:
             yield self[vid]
+
+#
+# pre-process
+#
+
+def recon_3d_bin_pred(pred_path, save_path, pred_ornt="LPS", data_root="data/ribsegv2", preproc=True):
+    """reconstruct the 1st stage binary segmentation to 3D volumes for all data
+    The orientation should be consistent with their original image.
+    Reconstructed voxel value: {-1: not predicted, 0: bg, 1: fg}
+    Args:
+        pred_path: str, path to the original fg-bg prediction (.npz)
+        save_path: str, path to save the reconstructed volumes (.nii.gz)
+        pred_ornt: str = "LPS", orientation of the predicted point clouds
+        data_root: str = "data/ribsegv2"
+        preproc: bool = True, use preprocessed data (see `preprocess`) or not
+    """
+    import open3d as o3d
+
+    os.makedirs(save_path, exist_ok=True)
+    for f in os.listdir(pred_path):
+        if not f.endswith(".npz"):
+            continue
+        vid = int(f[:-4])
+        print(vid, end='\r')
+        if preproc:
+            img_f = os.path.join(data_root, "pt_preproc", "{}-image.nii.gz".format(vid))
+        else:
+            img_f = os.path.join(data_root, "image", "RibFrac{}-image.nii.gz".format(vid))
+        img_nii = nib.load(img_f)
+        img_ornt = nib.aff2axcodes(img_nii.affine)
+
+        data = np.load(os.path.join(pred_path, f))
+        xyz = data["voxel_index"] # [n_batch, npt, 3] (or [n_batch, 3, npt])
+        pred = data["pred"] # [n_batch, npt]
+        # print(xyz.shape, pred.shape)
+        assert 0 <= pred.min() and pred.max() <= 1, "Invalid binary prediction value range: [{}, {}]".format(pred.min(), pred.max())
+        if pred.ndim > 1:
+            pred = pred.reshape(-1)
+            assert 3 == xyz.ndim, "voxel_index shape: {}".format(xyz.shape)
+            if 3 == xyz.shape[1]: # [n_batch, 3, npt]
+                xyz = xyz.transpose(0, 2, 1) # -> [n_batch, npt, 3]
+            xyz = xyz.reshape(-1, xyz.shape[-1])
+
+        need_reorient, axis_order_pred, _ = determine_reorient(img_ornt, pred_ornt)
+        if need_reorient:
+            # determine shape in predicted orientation <- used in reorient_points
+            shape_pred = tuple(img_nii.shape[axis_order_pred[i]] for i in range(3))
+            axes_range_pred = tuple((0, shape_pred[i]-1) for i in range(3))
+            # reorient indices to original image orientation
+            xyz = reorient_points(xyz, pred_ornt, img_ornt, axes_range_pred).astype(np.int32)
+
+        # remove outliers
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
+        _, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        xyz = xyz[ind]
+        pred = pred[ind]
+
+        # {-1: not predicted, 0: bg, 1: fg}
+        pred_3d = np.zeros(img_nii.shape, dtype=np.int8) - 1
+        pred_3d[xyz[:, 0], xyz[:, 1], xyz[:, 2]] = pred.astype(np.int8)
+
+        pred_nii = nib.Nifti1Image(pred_3d, img_nii.affine, img_nii.header)
+        nib.save(pred_nii, os.path.join(save_path, "{}.nii.gz".format(vid)))
+
+
+if "__main__" == __name__:
+    recon_3d_bin_pred(
+        "exp/ribsegv2/semseg-pt_v3m1_0_base-bin/result",
+        "exp/ribsegv2/semseg-pt_v3m1_0_base-bin/recon-3d-binpred",
+        preproc=True,
+    )

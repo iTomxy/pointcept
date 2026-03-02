@@ -50,6 +50,7 @@ dataset_type = "Ribsegv2Dataset"
 data_root = "data/ribsegv2"
 npoints = 15000
 hu_thres = 200
+grid_size = 2e-3 # small enough so that the point cloud resolution won't change much
 preproc = True # use preprocessed data (crop to foreground region) or not
 if preproc:
     # data/ribsegv2/complete-radius-preproc.json
@@ -70,7 +71,7 @@ data = dict(
         data_root=data_root,
         test_mode=False,
         transform=[
-            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
+            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4"), ("sieve_mask", "i1")), meta_key="intensity"),
             dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"), # won't affect `intensity`
             dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")), # so here `intensity` is still usable
             dict(type="ToPhysicalCoord"),
@@ -95,7 +96,7 @@ data = dict(
             dict(type="RandomShift",  shift=[[-0.02, 0.02], [-0.02, 0.02], [-0.02, 0.02]]),
             dict(
                 type="GridSample",
-                grid_size=0.01,
+                grid_size=grid_size,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
@@ -117,7 +118,7 @@ data = dict(
         data_root=data_root,
         test_mode=False,
         transform=[
-            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
+            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4"), ("sieve_mask", "i1")), meta_key="intensity"),
             dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"), # won't affect `intensity`
             dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")), # so here `intensity` is still usable
             dict(type="ToPhysicalCoord"),
@@ -126,7 +127,7 @@ data = dict(
             dict(type="CenterShift", apply_z=True),
             dict(
                 type="GridSample",
-                grid_size=0.01,
+                grid_size=grid_size,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
@@ -151,11 +152,13 @@ data = dict(
         drop_last_thres=npoints // 4,
         add_trainval_incomplete=True,
         preproc_transform=[ # data reading & preprocessing
-            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
+            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4"), ("sieve_mask", "i1")), meta_key="intensity"),
             dict(type="Reorient", keys=("intensity", "segment"), new_ornt="LPS"), # keep this at test cuz it affects voxel_index
             dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"),
             dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")),
             dict(type="ToPhysicalCoord"),
+            # dict(type="DropRibPoint", keys=("coord", "strength"), drop_depth=1, begin_from='i', single=''), # controlled test
+            # dict(type="TruncateRibPoint", keys=("coord", "strength"), drop_depth=6, begin_from='i', pos='m', is_axis=2), # controlled test
             dict(type="ExpandDims", key_axes=[("strength", 1)]),
             dict(type="NormalizeCoord", radius=global_radius),
         ],
@@ -165,7 +168,7 @@ data = dict(
             dict(type="CenterShift", apply_z=True),
             dict(
                 type="GridSample",
-                grid_size=0.01,
+                grid_size=grid_size,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
@@ -183,4 +186,6 @@ data = dict(
 )
 
 
-test = dict(type="SemSegVolumeTester", save_pred=True)
+# test = dict(type="SemSegVolumeTester", save_pred=False)
+test = dict(type="SemSegVolumeTester1Gpu", save_pred=False)
+# test = dict(type="SemSegVolumeTesterCmpTrunc", save_pred=False, drop_depth=6, begin_from='i', pos='m', is_axis=2)

@@ -12,7 +12,7 @@ import time
 import numpy as np
 import sklearn
 import nibabel as nib
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -22,16 +22,17 @@ from .defaults import create_ddp_model
 import pointcept.utils.comm as comm
 from pointcept.datasets import build_dataset, collate_fn
 from pointcept.models import build_model
-from pointcept.utils.logger import get_root_logger
+from pointcept.utils.logger import get_root_logger, get_logger
 from pointcept.utils.registry import Registry
 from pointcept.utils.misc import (
     AverageMeter,
     intersection_and_union,
     intersection_and_union_gpu,
     make_dirs,
-    confusion_matrix, calc_cm_metrics, vis_confusion_matrix,
-    clswise_cm_metrics_dist, to_dict,
+    vis_confusion_matrix,
+    to_dict, calc_stat, bootstrap_ci_mean_delta,
 )
+from pointcept.utils.eval_cm import *
 from pointcept.utils import eval_cluster
 from pointcept.utils.ins2sem import relabel_ribs_anatomical
 
@@ -82,6 +83,7 @@ class TesterBase:
             self.logger.info(f"Loading weight at: {self.cfg.weight}")
             checkpoint = torch.load(self.cfg.weight, weights_only=False)
             self.ckpt_epoch = checkpoint.get("epoch", -1)
+            print("ckpt epoch:", self.ckpt_epoch)
             weight = OrderedDict()
             for key, value in checkpoint["state_dict"].items():
                 if key.startswith("module."):
@@ -457,7 +459,7 @@ class SemSegTester2(SemSegTester):
 
 
 @TESTERS.register_module()
-class SemSegVolumeTester(TesterBase):
+class SemSegVolumeTester(SemSegTester):
     """(9 Jan 2026, iTom) volume-wise test"""
     def __init__(self, cfg, save_pred, *args, **kwargs):
         self.save_pred = save_pred
@@ -467,6 +469,7 @@ class SemSegVolumeTester(TesterBase):
         return build_dataset(self.cfg.data.test)
 
     def test(self):
+        assert 1 == self.cfg.batch_size_test_per_gpu
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start SemSegVolumeTester Evaluation >>>>>>>>>>>>>>>>")
         self.model.eval()
@@ -477,7 +480,9 @@ class SemSegVolumeTester(TesterBase):
         comm.synchronize()
         metrics_sum = None # accumulate class-wise metrics, then reduce at last in main process
         for vol_dset in self.test_loader:
-            vol_loader = torch.utils.data.DataLoader(vol_dset, batch_size=self.cfg.batch_size_test, shuffle=False)
+            vol_loader = torch.utils.data.DataLoader(
+                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
+                pin_memory=True, collate_fn=self.__class__.collate_fn)
             pred_dict = self.pred_volume(vol_loader)
             if self.save_pred:
                 np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
@@ -549,6 +554,7 @@ class SemSegVolumeTester(TesterBase):
         batch_npt = []
         for i, batch in enumerate(vol_loader):
             print(i, end='\r')
+            batch = batch[0] # current assume batch size is 1
             for key in batch.keys():
                 if isinstance(batch[key], torch.Tensor):
                     # print(key, batch[key].size())
@@ -563,6 +569,10 @@ class SemSegVolumeTester(TesterBase):
             index_list.append(batch["voxel_index"].cpu().numpy().astype(int)) # already [#points, 3]
             batch_npt.append(batch["segment"].size(0))
 
+        assert sum(batch_npt) == sum(len(pred) for pred in pred_list) == \
+            sum(len(label) for label in label_list) == \
+            sum(len(coord) for coord in coord_list) == \
+            sum(len(index) for index in index_list)
         return {
             "pred": np.concatenate(pred_list), # [#points]
             "label": np.concatenate(label_list), # [#points]
@@ -570,6 +580,310 @@ class SemSegVolumeTester(TesterBase):
             "voxel_index": np.concatenate(index_list), # [#points, 3]
             "batch_npt": np.asarray(batch_npt), # [#batches]
         }
+
+
+@TESTERS.register_module()
+class SemSegVolumeTester1Gpu(SemSegVolumeTester):
+    """(19 Feb 2026, iTom) ensure 1 GPU is used"""
+    def test(self):
+        assert 1 == comm.get_world_size(), "world size: {}".format(comm.get_world_size())
+        assert 1 == self.cfg.batch_size_test_per_gpu
+        logger = get_root_logger()
+        logger_vol = get_logger( # datum-wise logger
+            "SemSegVolumeTester1Gpu-vol",
+            log_file=os.path.join(self.cfg.save_path, "{}-{}-vol.log".format(self.cfg.data.test.split, self.__class__.__name__)),
+            fmt="%(message)s"
+        )
+        logger_vol.info(json.dumps({"time": time.asctime(time.gmtime())}))
+        # logger_batch = get_logger( # batch-wise logger
+        #     "SemSegVolumeTester1Gpu-batch",
+        #     log_file=os.path.join(self.cfg.save_path, "{}-{}-batch.log".format(self.cfg.data.test.split, self.__class__.__name__)),
+        #     fmt="%(message)s"
+        # )
+        # logger_batch.info(json.dumps({"time": time.asctime(time.gmtime())}))
+        logger.info(">>>>>>>>>>>>>>>> Start {} Evaluation >>>>>>>>>>>>>>>>".format(self.__class__.__name__))
+        self.model.eval()
+        if self.save_pred:
+            save_path = os.path.join(self.cfg.save_path, "result")
+            make_dirs(save_path)
+
+        # valid_cls_mask = torch.ones(self.cfg.data.num_classes, dtype=torch.bool).cuda(non_blocking=True)
+        # valid_cls_mask[self.cfg.data.bg_class] = False
+
+        comm.synchronize()
+        records = defaultdict(list)
+        for vol_dset in self.test_loader:
+            vol_loader = torch.utils.data.DataLoader(
+                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
+                pin_memory=True, collate_fn=self.__class__.collate_fn)
+            pred_dict = self.pred_volume(vol_loader)
+            if self.save_pred:
+                np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
+
+            tp, tn, fp, fn = confusion_matrix(
+                torch.LongTensor(pred_dict["pred"]),#.cuda(non_blocking=True),
+                torch.LongTensor(pred_dict["label"]),#.cuda(non_blocking=True),
+                self.cfg.data.num_classes
+            )
+            m = calc_cm_metrics(tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
+            m.update(error_rate(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
+            m.update(error_rate_rib(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
+            logger_vol.info(json.dumps({
+                "vid": vol_dset.volume_id,
+                "metrics": m,
+            }))
+            for k, v in m.items():
+                if isinstance(v, float):
+                    records[k].append(v)
+
+            print(vol_dset.volume_id, end='\r')
+
+        if comm.is_main_process():
+            metrics = {k: calc_stat(v) for k, v in records.items()}
+            with open(os.path.join(
+                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
+            ), 'w') as f:
+                json.dump({
+                    "time": time.asctime(time.gmtime()),
+                    "epoch": self.ckpt_epoch,
+                    "metrics": metrics,
+                    "args": to_dict(self.cfg),
+                }, f, indent=1)
+            for k, v in metrics.items():
+                logger.info("{}: {}".format(k, v))
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+
+@TESTERS.register_module()
+class SemSegVolumeTesterCmpTrunc(SemSegVolumeTester):
+    """(21 Feb 2026, iTom) compared with full volume w/o truncation:
+    to eliminate the truncation-induced metric change and
+    test whether truncation lets the model perform worse.
+
+    Compare at volume-level.
+
+    Assume the transform does NOT include TruncateRibPoint,
+    so the raw batch are sampled from the intact volume, and
+    this class will deal with truncation itself.
+    """
+    def __init__(self, cfg, drop_depth, begin_from='i', pos='m', is_axis=2, min_npt=789, *args, **kwargs):
+        """mimic `TruncateRibPoint`"""
+        super().__init__(cfg, *args, **kwargs)
+
+        rib_pairs = tuple((i, i+12) for i in range(1, 12+1))
+        drop_depth = int(drop_depth)
+        assert 1 <= drop_depth <= len(rib_pairs) - 1
+
+        self.begin_from = begin_from.lower()
+        if 's' == self.begin_from: # from S (top) to I (bottom)
+            self.anchor_rib_pair = torch.LongTensor(rib_pairs[drop_depth - 1])
+            self.keep_ribs = torch.LongTensor(rib_pairs[drop_depth: ]).flatten() # used for judgement in case anchor rib pair does not exist
+        elif 'i' == self.begin_from: # from I (bottom) to S (top)
+            self.anchor_rib_pair = torch.LongTensor(rib_pairs[- drop_depth])
+            self.keep_ribs = torch.LongTensor(rib_pairs[: - drop_depth]).flatten() # used for judgement in case anchor rib pair does not exist
+        else:
+            raise ValueError("{}: Unsupport `begin_from`: expect {}, got {}".format(
+                self.__class__.__name__, ('s', 'i'), self.begin_from
+            ))
+
+        self.keep_ribs = torch.cat([self.keep_ribs, torch.LongTensor([0])]) # keep BG points
+
+        self.anchor_rib_pair = self.anchor_rib_pair.cuda(non_blocking=True)
+        self.keep_ribs = self.keep_ribs.cuda(non_blocking=True)
+
+        self.pos = pos.lower()
+        valid_pos = (
+            'b', # truncate at rib boundary
+            'm', # at middle
+        )
+        assert self.pos in valid_pos, "{}: Unsupport `pos`: expect {}, got {}".format(
+            self.__class__.__name__, valid_pos, self.pos
+        )
+
+        self.is_axis = is_axis
+        self.min_npt = min_npt
+
+    def test(self):
+        assert 1 == comm.get_world_size()
+        assert 1 == self.cfg.batch_size_test_per_gpu
+        # print(self.cfg.batch_size_test_per_gpu, self.cfg.batch_size_test)
+        logger = get_root_logger()
+        logger_vol = get_logger( # datum-wise logger
+            "{}-vol".format(self.__class__.__name__),
+            log_file=os.path.join(self.cfg.save_path, "{}-{}-vol.log".format(self.cfg.data.test.split, self.__class__.__name__)),
+            fmt="%(message)s",
+            # file_mode='w',
+        )
+        logger_vol.info(json.dumps({"time": time.asctime(time.gmtime())}))
+        logger.info(">>>>>>>>>>>>>>>> Start {} Evaluation >>>>>>>>>>>>>>>>".format(self.__class__.__name__))
+        self.model.eval()
+        if self.save_pred:
+            save_path = os.path.join(self.cfg.save_path, "result")
+            make_dirs(save_path)
+
+        comm.synchronize()
+        records = defaultdict(list) # for intact/raw volume
+        records_trunc = defaultdict(list) # for truncated volume
+        records_delta = defaultdict(list) # for delta between intact and truncated
+        for vol_dset in self.test_loader:
+            vol_loader = torch.utils.data.DataLoader(
+                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
+                pin_memory=True, collate_fn=self.__class__.collate_fn)
+            # pred_dict = self.pred_volume(vol_loader)
+            # if self.save_pred:
+            #     np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
+            pred_list, pred_trunc_list, label_trunc_list = [], [], []
+            for i, batch in enumerate(vol_loader):
+                print(i, end='\r')
+                batch = batch[0] # current assume batch size is 1
+                for key in batch.keys():
+                    if isinstance(batch[key], torch.Tensor):
+                        # if "offset" == key:
+                        #     print(key, batch[key].size(), batch[key])
+                        # else:
+                        #     print(key, batch[key].size())
+
+                        # coord torch.Size([13392, 3])
+                        # grid_coord torch.Size([13392, 3])
+                        # segment torch.Size([13392])
+                        # voxel_index torch.Size([13392, 3])
+                        # offset torch.Size([1]) tensor([13392])
+                        # feat torch.Size([13392, 1])
+                        batch[key] = batch[key].cuda(non_blocking=True)
+
+                trunc_mask = self.mask(batch["coord"], batch["segment"])
+                if not trunc_mask.any():
+                    # too few points left after truncation -> skip
+                    continue
+
+                with torch.no_grad():
+                    # 1. full input, truncate prediction
+                    output_dict = self.model(batch)
+                    pred = output_dict["seg_logits"].max(1)[1]
+                    # print("pred:", pred.size()) # [npt]
+                    pred = pred[trunc_mask].cpu().numpy() # truncate prediction
+                    pred_list.append(pred)
+
+                    # 2. truncated input
+                    batch_trunc = {
+                        k: v[trunc_mask]
+                        if isinstance(v, torch.Tensor) and k in ("coord", "grid_coord", "segment", "feat")#, "voxel_index")
+                        else v
+                        for k, v in batch.items()
+                    }
+                    npt = batch_trunc["coord"].size(0)
+                    batch_trunc["offset"] = torch.tensor([npt], device=batch_trunc["coord"].device, dtype=batch["offset"].dtype) # update offset
+                    pred_trunc = self.model(batch_trunc)["seg_logits"].max(1)[1].cpu().numpy()
+                    # print("pred_trunc:", pred_trunc.shape) # [npt]
+                    label_trunc = batch_trunc["segment"].cpu().numpy()
+                    pred_trunc_list.append(pred_trunc)
+                    label_trunc_list.append(label_trunc)
+
+            # concatenate batches to be volume-level pred/label
+            if len(pred_list) == 0 or len(pred_trunc_list) == 0:
+                # in case no valid batch (after truncation) in this volume, skip this volume
+                # should not happen
+                logger_vol.info(json.dumps({
+                    "vid": vol_dset.volume_id,
+                    "msg": "skipped cuz no valid batch after truncation",
+                }))
+                continue
+
+            pred = np.concatenate(pred_list)
+            pred_trunc = np.concatenate(pred_trunc_list)
+            label_trunc = np.concatenate(label_trunc_list)
+
+            # test truncated prediction of intact/full volume
+            log_dict = {"vid": vol_dset.volume_id}
+            tp, tn, fp, fn = confusion_matrix(
+                torch.LongTensor(pred),
+                torch.LongTensor(label_trunc),
+                self.cfg.data.num_classes
+            )
+            m = calc_cm_metrics(tp.numpy(), tn.numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
+            m.update(error_rate(pred, label_trunc, self.cfg.data.bg_class))
+            m.update(error_rate_rib(pred, label_trunc, self.cfg.data.bg_class))
+            log_dict["metrics"] = m
+            for k, v in m.items():
+                if isinstance(v, float):
+                    records[k].append(v)
+
+            # test truncated input
+            tp, tn, fp, fn = confusion_matrix(
+                torch.LongTensor(pred_trunc), # here
+                torch.LongTensor(label_trunc),
+                self.cfg.data.num_classes
+            )
+            m = calc_cm_metrics(tp.numpy(), tn.numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
+            m.update(error_rate(pred_trunc, label_trunc, self.cfg.data.bg_class)) # here
+            m.update(error_rate_rib(pred_trunc, label_trunc, self.cfg.data.bg_class)) # here
+            log_dict["metrics_trunc"] = m
+            for k, v in m.items():
+                if isinstance(v, float):
+                    records_trunc[k].append(v)
+
+            # delta
+            log_dict["metrics_delta"] = {}
+            for k in records.keys():
+                log_dict["metrics_delta"][k] = records[k][-1] - records_trunc[k][-1]
+                records_delta[k].append(log_dict["metrics_delta"][k])
+
+            logger_vol.info(json.dumps(log_dict))
+            print(vol_dset.volume_id, end='\r')
+
+        if comm.is_main_process():
+            metrics = {k: calc_stat(v) for k, v in records.items()}
+            metrics_trunc = {k: calc_stat(v) for k, v in records_trunc.items()}
+            metrics_delta = {}
+            for k, v in records_delta.items():
+                metrics_delta[k] = calc_stat(v)
+                metrics_delta[k+"-ci_95%"] = bootstrap_ci_mean_delta(v, alpha=0.05)
+
+            with open(os.path.join(
+                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
+            ), 'w') as f:
+                json.dump({
+                    "time": time.asctime(time.gmtime()),
+                    "epoch": self.ckpt_epoch,
+                    "metrics": metrics,
+                    "metrics_trunc": metrics_trunc,
+                    "metrics_delta": metrics_delta,
+                    "args": to_dict(self.cfg),
+                }, f, indent=1)
+            for k, v in metrics.items():
+                logger.info("{}: {}".format(k, v))
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+    def mask(self, coord, segment):
+        """
+        Args:
+            coord: float[npt, 3]
+            segment: int[npt]
+        Returns:
+            mask: bool[npt]
+        """
+        anchor_mask = torch.isin(segment, self.anchor_rib_pair)
+        if not anchor_mask.any(): # anchor rib does not exist
+            mask = torch.isin(segment, self.keep_ribs)
+        else:
+            anchor_coord = coord[anchor_mask] # [m, 3+?]
+            if 'm' == self.pos:
+                cut_z = anchor_coord[:, self.is_axis].mean()
+            elif 's' == self.begin_from: # truncate Superior, keep Inferior
+                cut_z = anchor_coord[:, self.is_axis].min() # lower boundary to remove anchor rib
+            else: # truncate Inferior, keep Superior
+                cut_z = anchor_coord[:, self.is_axis].max() # upper boundary to remove anchor rib
+
+            if 's' == self.begin_from: # truncate Superior (larger), keep Inferior (smaller)
+                mask = coord[:, self.is_axis] < cut_z
+            else: # truncate Inferior, keep Superior
+                mask = coord[:, self.is_axis] > cut_z
+
+        if mask.sum().item() < self.min_npt:
+            # too few points -> should ignore this batch
+            mask.fill_(False)
+
+        return mask
 
 
 @TESTERS.register_module()

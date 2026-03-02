@@ -27,8 +27,10 @@ mkdir -p /data /projects /scratch
 /opt/conda/bin/pip uninstall -y open3d-cpu
 /opt/conda/bin/pip install --no-cache-dir \
     scikit-learn scikit-image opencv-python-headless pyyaml \
-    SimpleITK nibabel medpy itk jupyterlab open3d seaborn
+    SimpleITK nibabel medpy itk jupyterlab ipykernel open3d seaborn
 
+# install jupyter kernel
+/opt/conda/bin/python -m ipykernel install --name "pointcept" --display-name "Pointcept (singularity)"
 
 # let `py` point to the right python
 ln -s /opt/conda/bin/python /usr/local/bin/py

@@ -1,21 +1,9 @@
-# iTom, 2025 dec 8
-# Adapted from:
-# - ../matterport3d/semseg-pt-v3m1-0-base.py
-# - ./semseg-dgcnn.py
-
-_base_ = ["../_base_/default_runtime.py"]
-enable_wandb = False # to avoid bug
-enable_amp = False # https://github.com/Pointcept/Pointcept/issues/249#issuecomment-2109206794
-
-
-# misc custom setting
-batch_size = 8  # bs: total bs in all gpus
-batch_size_test = None  # auto adapt to bs 1 for each gpu
+_base_ = ["semseg-pt_v3m1_0_base-bin.py"]
 
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
-    num_classes=1+1, # fg vs. bg
+    num_classes=24+1,
     backbone_out_channels=64,
     backbone=dict(
         type="PT-v3m1",
@@ -52,24 +40,10 @@ model = dict(
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
-        # dict(type="FocalLoss", loss_weight=1.0, ignore_index=-1),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
 )
 
-# scheduler settings
-epoch = 100
-eval_epoch = epoch
-optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
-scheduler = dict(
-    type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
-    pct_start=0.05,
-    anneal_strategy="cos",
-    div_factor=10.0,
-    final_div_factor=1000.0,
-)
-param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
 dataset_type = "Ribsegv2Dataset"
@@ -86,14 +60,12 @@ else:
     # data/ribsegv2/complete-radius.json
     global_radius = 259.16 # in mm, 99.5% percentage of complete volume in physical coordinate
 
+
 data = dict(
-    num_classes=1+1,
+    num_classes=24+1,
     bg_class=0,
     ignore_index=-1,
-    names=(
-        "background",
-        "rib",
-    ),
+    names=("background",) + tuple("rib{}".format(i) for i in range(1, 24+1)),
     train=dict(
         type=dataset_type,
         split="train",
@@ -101,20 +73,9 @@ data = dict(
         test_mode=False,
         transform=[
             dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
-            dict(type="BinarizeLabel", coi=fg_classes),
             dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"), # won't affect `intensity`
-            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")),# dilate_connect=3), # so here `intensity` is still usable
+            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength"), coi=fg_classes), # so here `intensity` is still usable
             dict(type="ToPhysicalCoord"),
-            # dict(type='CTIntensityVariation',
-            #     intensity_shift_range=(-30, 30),  # ±30 HU shift
-            #     intensity_scale_range=(0.98, 1.02),  # ±2% scaling
-            #     gamma_range=(0.95, 1.05),  # subtle gamma correction
-            #     p=0.8
-            # ),
-            # dict(type='CTDensityNoise',
-            #     noise_std=8,  # 8 HU standard deviation
-            #     p=0.5
-            # ),
             dict(type="RandomApply", cfgs=[ # after ToPhysicalCoord
                 dict(type="RandomDropRibPoint", keys=("coord", "strength"), max_drop_depth=7, begin_from='', allow_single=True, p=0.5),
                 dict(type="RandomTruncateRibPoint", keys=("coord", "strength"), max_drop_depth=7, begin_from='', pos='', p=0.5, is_axis=2),
@@ -148,9 +109,8 @@ data = dict(
         test_mode=False,
         transform=[
             dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
-            dict(type="BinarizeLabel", coi=fg_classes),
             dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"), # won't affect `intensity`
-            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")),# dilate_connect=3), # so here `intensity` is still usable
+            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength"), coi=fg_classes), # so here `intensity` is still usable
             dict(type="ToPhysicalCoord"),
             dict(type="ExpandDims", key_axes=[("strength", 1)]),
             dict(type="NormalizeCoord", radius=global_radius), # before SamplePoint
@@ -162,10 +122,9 @@ data = dict(
                 mode="train",
                 return_grid_coord=True,
             ),
-            dict(type="SamplePoint", npoints=npoints, keys=["coord", "grid_coord", "segment", "strength"]),
+            dict(type="SamplePoint", npoints=npoints, keys=["coord", "grid_coord", "segment", "strength"]), # after GridSample
             dict(type="CenterShift", apply_z=False),
             dict(type="ToTensor"),
-            # dict(type="Transpose", keys=["coord", "strength"], axes=[1, 0]), # [npt, 3] -> [3, npt]
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment"),
@@ -175,18 +134,20 @@ data = dict(
     ),
     test=dict(
         type="Ribsegv2VolumeLoader",
-        split="all", # for binary segmentation, test & save all volume prediction
+        split="test",
         dataset_cls="Ribsegv2Volume",
         npoints=npoints,
         data_root=data_root,
         drop_last_thres=npoints // 4,
+        add_trainval_incomplete=True,
         preproc_transform=[ # data reading & preprocessing
             dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
-            dict(type="BinarizeLabel", coi=fg_classes),
             dict(type="Reorient", keys=("intensity", "segment"), new_ornt="LPS"), # keep this at test cuz it affects voxel_index
             dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"),
-            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")),# dilate_connect=3),
+            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength"), coi=fg_classes), # so here `intensity` is still usable
             dict(type="ToPhysicalCoord"),
+            # dict(type="DropRibPoint", keys=("coord", "strength"), drop_depth=1, begin_from='i', single=''), # controlled test
+            # dict(type="TruncateRibPoint", keys=("coord", "strength"), drop_depth=6, begin_from='i', pos='m', is_axis=2), # controlled test
             dict(type="ExpandDims", key_axes=[("strength", 1)]),
             dict(type="NormalizeCoord", radius=global_radius),
         ],
@@ -203,7 +164,7 @@ data = dict(
             ),
             dict(type="CenterShift", apply_z=False),
             dict(type="ToTensor"),
-            # dict(type="Transpose", keys=["coord", "strength"], axes=[1, 0]), # [npt, 3] -> [3, npt]
+            # dict(type="Transpose", keys=["coord", "grid_coord", "strength"], axes=[1, 0]), # [npt, 3] -> [3, npt]
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment", "voxel_index"),
@@ -212,16 +173,3 @@ data = dict(
         ],
     ),
 )
-
-
-test = dict(type="SemSegVolumeTester1Gpu", save_pred=True)
-
-hooks = [
-    dict(type="CheckpointLoader"),
-    dict(type="ModelHook"),
-    dict(type="IterationTimer", warmup_iter=2),
-    dict(type="InformationWriter"),
-    dict(type="SemSegEvaluator"),
-    dict(type="CheckpointSaver", save_freq=None),
-    # dict(type="PreciseEvaluator", test_last=False),
-]
