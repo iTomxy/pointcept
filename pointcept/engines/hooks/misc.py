@@ -25,6 +25,7 @@ from pointcept.utils.comm import is_main_process, synchronize
 from pointcept.utils.cache import shared_dict
 from pointcept.utils.scheduler import CosineScheduler
 import pointcept.utils.comm as comm
+from pointcept.utils.misc import to_dict
 
 from .default import HookBase
 from .builder import HOOKS
@@ -206,6 +207,7 @@ class CheckpointSaver(HookBase):
                         else None
                     ),
                     "best_metric_value": self.trainer.best_metric_value,
+                    "train_cfg": to_dict(self.trainer.cfg),
                 },
                 filename + ".tmp",
             )

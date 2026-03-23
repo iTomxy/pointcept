@@ -347,3 +347,33 @@ class MultiDatasetTrainer(Trainer):
         )
         self.comm_info["iter_per_epoch"] = len(train_loader)
         return train_loader
+
+
+@TRAINERS.register_module()
+class TrainerValLoader(Trainer):
+    """`build_val_loader` directly builds data loader, not wrapped by PyTorch dataloader"""
+    def build_val_loader(self):
+        val_loader = None
+        if self.cfg.evaluate:
+            val_data = build_dataset(self.cfg.data.val)
+            # Volume-wise validation datasets (e.g. Ribsegv2VolumeLoader) should
+            # be assigned by volume rather than sharded by a DistributedSampler.
+            # The custom volume evaluator will iterate this dataset directly and
+            # build per-volume patch loaders on each rank.
+            if hasattr(val_data, "id_list") and hasattr(val_data, "__iter__"):
+                val_loader = val_data
+            else:
+                if comm.get_world_size() > 1:
+                    val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
+                else:
+                    val_sampler = None
+                val_loader = torch.utils.data.DataLoader(
+                    val_data,
+                    batch_size=self.cfg.batch_size_val_per_gpu,
+                    shuffle=False,
+                    num_workers=self.cfg.num_worker_per_gpu,
+                    pin_memory=True,
+                    sampler=val_sampler,
+                    collate_fn=collate_fn,
+                )
+        return val_loader

@@ -16,11 +16,11 @@ Adapted from ./scannet.py/ScanNetDataset
 IGNORE_VOLUMES = (452, 485, 490)
 IGNORE_VOLUMES += (
     # (17 Dec 2025, iTom) potential wrong label
-    439, 462, 471, 487, 540,
+    439, 462, 471, 487, #540,
     # (17 Dec 2025, iTom) too hard, seemingly unable to solve
-    652,
+    # 652,
     # (22 Jan 2026, iTom) too noisy, even binary seg cannot work well, ignore for now
-    501, 507, 570, 589, 630, 653,
+    # 501, 507, 570, 589, 630, 653,
 )
 SPLITS = {
     "train": [x for x in range(1, 421) if x not in IGNORE_VOLUMES],
@@ -110,6 +110,136 @@ class Ribsegv2Volume(Dataset):
         batch_idx = self.shuffle_indices[index * self.npoints: (index + 1) * self.npoints]
         return self.transform({"sample_idx": batch_idx, **self.data_dict})
 
+
+class Ribsegv2VolumePatch(Dataset):
+    def __init__(self,
+        volume_id,
+        preproc_transform=None, # config dict, for volume reading & preprocessing
+        transform=None, # config dict, remaining augmentations
+        npoints=15000,
+        patch_size=(128.0, 128.0, 196.0),
+        stride=(None, None, None), # patch moving stride. None = patch size in that axis.
+        drop_last_thres=0, # drop the last batch if it has less #points than this threshold
+        data_root='data/ribsegv2',
+    ):
+        super(Ribsegv2VolumePatch, self).__init__()
+        self.volume_id = volume_id
+        self.transform = Compose(transform)
+        assert npoints > 0
+        assert drop_last_thres >= 0
+        self.npoints = npoints
+        self.drop_last_thres = drop_last_thres
+        assert isinstance(patch_size, (int, float, tuple, list))
+        if isinstance(patch_size, (int, float)):
+            patch_size = (patch_size,) * 3
+        assert len(patch_size) == 3
+        self.patch_size = np.asarray(patch_size, dtype=np.float32)
+        assert isinstance(stride, (tuple, list))
+        assert len(stride) == 3
+        self.stride = np.asarray(
+            [self.patch_size[i] if stride[i] is None else stride[i] for i in range(3)],
+            dtype=np.float32,
+        )
+        self.data_dict = Compose(preproc_transform)(dict(
+            intensity=os.path.join(data_root, "pt_preproc", "{}-image.nii.gz".format(volume_id)),
+            segment=os.path.join(data_root, "pt_preproc", "{}-label.nii.gz".format(volume_id)),
+            sieve_mask=os.path.join(data_root, "binpred", "{}.nii.gz".format(volume_id)),
+            index_valid_keys=["coord", "strength", "segment", "voxel_index"], # don't use tuple
+        ))
+
+        coord = self.data_dict["coord"][:, :3]
+        coord_min = coord.min(0)
+        coord_max = coord.max(0)
+        volume_size = coord_max - coord_min
+        patch_size = np.minimum(self.patch_size.astype(coord.dtype), volume_size)
+        patch_size = np.where(patch_size > 0, patch_size, volume_size)
+        stride = self.stride.astype(coord.dtype)
+        stride = np.where(stride > 0, stride, patch_size)
+
+        patch_starts = self._build_patch_starts(coord_min, coord_max, patch_size, stride)
+        self.sample_indices = []
+        for x0 in patch_starts[0]:
+            x1 = x0 + patch_size[0]
+            mask_x = self._axis_mask(coord[:, 0], x0, x1, is_last=np.isclose(x1, coord_max[0]))
+            if not mask_x.any():
+                continue
+            for y0 in patch_starts[1]:
+                y1 = y0 + patch_size[1]
+                mask_xy = mask_x & self._axis_mask(coord[:, 1], y0, y1, is_last=np.isclose(y1, coord_max[1]))
+                if not mask_xy.any():
+                    continue
+                for z0 in patch_starts[2]:
+                    z1 = z0 + patch_size[2]
+                    mask = mask_xy & self._axis_mask(coord[:, 2], z0, z1, is_last=np.isclose(z1, coord_max[2]))
+                    patch_idx = np.flatnonzero(mask)
+                    if patch_idx.size == 0:
+                        continue
+                    self.sample_indices.extend(self._split_patch_indices(patch_idx))
+
+        assert len(self.sample_indices) > 0, "Empty volume patch dataset {}: coord.shape = {}, patch_size = {}, npoints = {}, drop_last_thres = {}".format(
+            volume_id, coord.shape, tuple(self.patch_size.tolist()), npoints, drop_last_thres
+        )
+
+    @staticmethod
+    def _axis_mask(coord_axis, lower, upper, is_last):
+        if is_last:
+            return (coord_axis >= lower) & (coord_axis <= upper)
+        return (coord_axis >= lower) & (coord_axis < upper)
+
+    @staticmethod
+    def _build_axis_starts(axis_min, axis_max, patch_size, stride):
+        axis_length = axis_max - axis_min
+        if axis_length <= patch_size or np.isclose(axis_length, patch_size):
+            return np.asarray([axis_min], dtype=np.float32)
+
+        starts = []
+        start = axis_min
+        last_start = axis_max - patch_size
+        while start < axis_max:
+            starts.append(min(start, last_start))
+            if start >= last_start:
+                break
+            start += stride
+
+        starts = np.asarray(starts, dtype=np.float32)
+        _, unique_idx = np.unique(np.round(starts, decimals=6), return_index=True)
+        return starts[np.sort(unique_idx)]
+
+    @classmethod
+    def _build_patch_starts(cls, coord_min, coord_max, patch_size, stride):
+        return [
+            cls._build_axis_starts(coord_min[axis], coord_max[axis], patch_size[axis], stride[axis])
+            for axis in range(3)
+        ]
+
+    def _split_patch_indices(self, patch_idx):
+        patch_idx = np.random.permutation(patch_idx)
+        if patch_idx.shape[0] % self.npoints != 0:
+            n_left = patch_idx.shape[0] % self.npoints
+            if n_left >= self.drop_last_thres or patch_idx.shape[0] < self.npoints:
+                n_pad = self.npoints - n_left
+                pad_idx = np.random.choice(patch_idx, n_pad, replace=True)
+                patch_idx = np.concatenate((patch_idx, pad_idx), axis=0)
+
+        if patch_idx.shape[0] == 0:
+            return []
+
+        if patch_idx.shape[0] < self.npoints:
+            n_pad = self.npoints - patch_idx.shape[0]
+            pad_idx = np.random.choice(patch_idx, n_pad, replace=True)
+            patch_idx = np.concatenate((patch_idx, pad_idx), axis=0)
+
+        return [
+            patch_idx[i * self.npoints: (i + 1) * self.npoints]
+            for i in range(len(patch_idx) // self.npoints)
+        ]
+
+    def __len__(self):
+        return len(self.sample_indices)
+
+    def __getitem__(self, index):
+        return self.transform({"sample_idx": self.sample_indices[index], **self.data_dict})
+
 #
 # Loader of Volume-wise Dataset (for testint)
 #
@@ -118,6 +248,7 @@ class Ribsegv2Volume(Dataset):
 class Ribsegv2VolumeLoader:
     DATASET_CLASSES = {c.__name__: c for c in [
         Ribsegv2Volume,
+        Ribsegv2VolumePatch,
     ]}
 
     def __init__(self, split, dataset_cls, **kwargs):

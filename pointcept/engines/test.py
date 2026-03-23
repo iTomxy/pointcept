@@ -583,10 +583,69 @@ class SemSegVolumeTester(SemSegTester):
 
 
 @TESTERS.register_module()
+class SemSegVolumeTesterOverlap(SemSegVolumeTester):
+    """Volume-wise tester that merges overlapping patch predictions by voxel index.
+
+    For duplicated voxels coming from overlapping patches, this averages the raw
+    logits before taking argmax, which is more stable than voting on hard labels.
+    """
+
+    def pred_volume(self, vol_loader):
+        logits_list, label_list, index_list, coord_list = [], [], [], []
+        batch_npt = []
+        for i, batch in enumerate(vol_loader):
+            print(i, end='\r')
+            batch = batch[0]  # current assume batch size is 1
+            for key in batch.keys():
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].cuda(non_blocking=True)
+
+            with torch.no_grad():
+                output_dict = self.model(batch)
+
+            logits_list.append(output_dict["seg_logits"].cpu().numpy())  # [#points, #classes]
+            label_list.append(batch["segment"].cpu().numpy())  # [#points]
+            coord_list.append(batch["coord"].cpu().numpy())  # [#points, 3]
+            index_list.append(batch["voxel_index"].cpu().numpy().astype(np.int64))  # [#points, 3]
+            batch_npt.append(batch["segment"].size(0))
+
+        assert sum(batch_npt) == sum(logits.shape[0] for logits in logits_list) == \
+            sum(len(label) for label in label_list) == \
+            sum(len(coord) for coord in coord_list) == \
+            sum(len(index) for index in index_list)
+
+        logits = np.concatenate(logits_list, axis=0)
+        label = np.concatenate(label_list, axis=0)
+        coord = np.concatenate(coord_list, axis=0)
+        voxel_index = np.concatenate(index_list, axis=0)
+
+        unique_index, first_idx, inverse, counts = np.unique(
+            voxel_index, axis=0, return_index=True, return_inverse=True, return_counts=True
+        )
+        logits_merged = np.zeros((unique_index.shape[0], logits.shape[1]), dtype=np.float64)
+        np.add.at(logits_merged, inverse, logits)
+        logits_merged /= counts[:, None]
+
+        coord_merged = coord[first_idx]
+        label_merged = label[first_idx]
+        pred_merged = logits_merged.argmax(1).astype(label_merged.dtype, copy=False)
+
+        return {
+            "pred": pred_merged, # [#unique_points]
+            "label": label_merged, # [#unique_points]
+            "coord": coord_merged, # [#unique_points, 3+?]
+            "voxel_index": unique_index, # [#unique_points, 3]
+            "logit": logits_merged, # [#unique_points, #classes]
+            "count": counts, # [#unique_points]
+            "batch_npt": np.asarray(batch_npt), # [#patches]
+        }
+
+
+@TESTERS.register_module()
 class SemSegVolumeTester1Gpu(SemSegVolumeTester):
     """(19 Feb 2026, iTom) ensure 1 GPU is used"""
     def test(self):
-        assert 1 == comm.get_world_size(), "world size: {}".format(comm.get_world_size())
+        assert 1 == comm.get_world_size(), "world size: {} > 1".format(comm.get_world_size())
         assert 1 == self.cfg.batch_size_test_per_gpu
         logger = get_root_logger()
         logger_vol = get_logger( # datum-wise logger
@@ -610,7 +669,7 @@ class SemSegVolumeTester1Gpu(SemSegVolumeTester):
         # valid_cls_mask = torch.ones(self.cfg.data.num_classes, dtype=torch.bool).cuda(non_blocking=True)
         # valid_cls_mask[self.cfg.data.bg_class] = False
 
-        comm.synchronize()
+        # comm.synchronize()
         records = defaultdict(list)
         for vol_dset in self.test_loader:
             vol_loader = torch.utils.data.DataLoader(
@@ -623,6 +682,69 @@ class SemSegVolumeTester1Gpu(SemSegVolumeTester):
             tp, tn, fp, fn = confusion_matrix(
                 torch.LongTensor(pred_dict["pred"]),#.cuda(non_blocking=True),
                 torch.LongTensor(pred_dict["label"]),#.cuda(non_blocking=True),
+                self.cfg.data.num_classes
+            )
+            m = calc_cm_metrics(tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
+            m.update(error_rate(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
+            m.update(error_rate_rib(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
+            logger_vol.info(json.dumps({
+                "vid": vol_dset.volume_id,
+                "metrics": m,
+            }))
+            for k, v in m.items():
+                if isinstance(v, float):
+                    records[k].append(v)
+
+            print(vol_dset.volume_id, end='\r')
+
+        if comm.is_main_process():
+            metrics = {k: calc_stat(v) for k, v in records.items()}
+            with open(os.path.join(
+                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
+            ), 'w') as f:
+                json.dump({
+                    "time": time.asctime(time.gmtime()),
+                    "epoch": self.ckpt_epoch,
+                    "metrics": metrics,
+                    "args": to_dict(self.cfg),
+                }, f, indent=1)
+            for k, v in metrics.items():
+                logger.info("{}: {}".format(k, v))
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+
+@TESTERS.register_module()
+class SemSegVolumeTesterOverlap1Gpu(SemSegVolumeTesterOverlap):
+    """Single-GPU overlap-aware version of `SemSegVolumeTester1Gpu`."""
+    def test(self):
+        assert 1 == comm.get_world_size(), "world size: {}".format(comm.get_world_size())
+        assert 1 == self.cfg.batch_size_test_per_gpu
+        logger = get_root_logger()
+        logger_vol = get_logger(
+            "SemSegVolumeTesterOverlap1Gpu-vol",
+            log_file=os.path.join(self.cfg.save_path, "{}-{}-vol.log".format(self.cfg.data.test.split, self.__class__.__name__)),
+            fmt="%(message)s"
+        )
+        logger_vol.info(json.dumps({"time": time.asctime(time.gmtime())}))
+        logger.info(">>>>>>>>>>>>>>>> Start {} Evaluation >>>>>>>>>>>>>>>>".format(self.__class__.__name__))
+        self.model.eval()
+        if self.save_pred:
+            save_path = os.path.join(self.cfg.save_path, "result")
+            make_dirs(save_path)
+
+        comm.synchronize()
+        records = defaultdict(list)
+        for vol_dset in self.test_loader:
+            vol_loader = torch.utils.data.DataLoader(
+                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
+                pin_memory=True, collate_fn=self.__class__.collate_fn)
+            pred_dict = self.pred_volume(vol_loader)
+            if self.save_pred:
+                np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
+
+            tp, tn, fp, fn = confusion_matrix(
+                torch.LongTensor(pred_dict["pred"]),
+                torch.LongTensor(pred_dict["label"]),
                 self.cfg.data.num_classes
             )
             m = calc_cm_metrics(tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)

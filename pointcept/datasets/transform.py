@@ -467,18 +467,79 @@ class CropBoundary(object):
 
 
 @TRANSFORMS.register_module()
+class RandomPatchPoint:
+    """randomly crop a 3D patch from a point cloud volume"""
+    def __init__(self, patch_size, keys):
+        """
+        patch_size: float or float[3], patch size in three axes
+        keys: List[str], crop what fields
+        """
+        assert isinstance(patch_size, (float, tuple, list))
+        if isinstance(patch_size, float):
+            patch_size = (patch_size,) * 3
+        assert len(patch_size) == 3
+        self.patch_size = patch_size
+
+        if isinstance(keys, str):
+            keys = [keys]
+        if "coord" not in keys:
+            keys.append("coord")
+        self.keys = keys
+
+    def __call__(self, data_dict):
+        """
+        coord: [npt, 3]
+        segment: [npt]
+        strength: [npt]
+        """
+        # choose one point as centroid
+        npt, _ = data_dict["coord"].shape # [npt, 3]
+        centroid = data_dict["coord"][np.random.randint(0, npt)]
+        # calculate patch bbox around centroid
+        _min = data_dict["coord"][:, :3].min(0) # [3]
+        _max = data_dict["coord"][:, :3].max(0)
+        volume_size = _max - _min
+        patch_size = np.minimum(np.asarray(self.patch_size, dtype=data_dict["coord"].dtype), volume_size)
+
+        patch_min = centroid - patch_size / 2
+        patch_max = centroid + patch_size / 2
+
+        # Shift the patch back into the volume if it crosses the boundary.
+        patch_min = np.maximum(patch_min, _min)
+        patch_max = patch_min + patch_size
+        patch_max = np.minimum(patch_max, _max)
+        patch_min = patch_max - patch_size
+
+        coord = data_dict["coord"][:, :3]
+        mask = np.ones(npt, dtype=bool)
+        for axis in range(3):
+            if np.isclose(patch_size[axis], volume_size[axis]):
+                continue
+            if axis < 2:
+                mask &= (coord[:, axis] >= patch_min[axis]) & (coord[:, axis] < patch_max[axis])
+            else:
+                mask &= (coord[:, axis] >= patch_min[axis]) & (coord[:, axis] <= patch_max[axis])
+
+        for key in self.keys:
+            if key in data_dict:
+                data_dict[key] = data_dict[key][mask]
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class CT2PointCloud:
     """convert a CT scan (3D voxel grids) to point cloud
     This transform uses the `intensity` field to sieve voxels, assuming it is
     the raw UNnormalised HU value. But use it AFTER NormalizeIntensity, which
     can place the normalised intensity in `norm_intensity` and thus won't affect.
     """
-    def __init__(self, hu_thres, coi=None, keys=["segment", "strength"], dilate_connect=0):
+    def __init__(self, hu_thres, coi=None, keys=["segment", "strength"], dilate_coi=None, dilate_iter=20):
         """
         hu_thres: float, HU threshold, only select voxels with intensity above
         coi: int|List[int] = None, classes of interest, if provided, only select voxels with class of interest
         keys: str|List[str] = ["segment"], apply the sieving to which field
-        dilate_connect: int = 0, dilation connectivity. If >0, dilate the binary sieving mask.
+        dilate_coi: List[int] = None, dilate the sieving mask around voxels of these classes
+        dilate_iter: int = 20: dilate iteration
         """
         self.hu_thres = hu_thres
         if coi is not None:
@@ -488,7 +549,9 @@ class CT2PointCloud:
             keys = [keys]
         self.keys = keys
         # generate_binary_structure: `3` for 3D
-        self.struct_3d = generate_binary_structure(3, dilate_connect) if dilate_connect > 0 else None
+        self.struct_3d = generate_binary_structure(3, 1) if dilate_coi is not None and dilate_iter > 0 else None
+        self.dilate_coi = np.asarray([dilate_coi]).flatten() if dilate_coi is not None else None
+        self.dilate_iter = dilate_iter
 
     def sieve(self, data_dict):
         """
@@ -510,7 +573,9 @@ class CT2PointCloud:
 
         if self.struct_3d is not None:
             # dilate the mask to keep some surrounding non-bone voxels to help separate near-by bones
-            mask = binary_dilation(mask, structure=self.struct_3d)
+            mask_coi = np.isin(data_dict["segment"], self.dilate_coi)
+            mask_coi = binary_dilation(mask_coi, structure=self.struct_3d, iterations=self.dilate_iter)
+            mask |= mask_coi
 
         return mask
 
