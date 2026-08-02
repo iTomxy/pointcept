@@ -14,6 +14,7 @@ outputs/
 */.DS_Store
 **/*.out
 # Dockerfile
+.nfs*
 
 *.log
 .ipynb_checkpoints

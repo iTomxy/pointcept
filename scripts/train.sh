@@ -81,7 +81,7 @@ CONFIG_DIR=configs/${DATASET}/${CONFIG}.py
 
 echo " =========> CREATE EXP DIR <========="
 echo "Experiment dir: $ROOT_DIR/$EXP_DIR"
-if [ "${RESUME}" = true ] && [ -d "$EXP_DIR" ]
+if [ "${RESUME}" = true ] && [ -f "${MODEL_DIR}/model_last.pth" ]
 then
   CONFIG_DIR=${EXP_DIR}/config.py
   WEIGHT=$MODEL_DIR/model_last.pth

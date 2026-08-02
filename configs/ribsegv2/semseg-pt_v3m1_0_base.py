@@ -2,7 +2,17 @@
 _base_ = ["../_base_/default_runtime.py"]
 enable_wandb = False # to avoid bug
 enable_amp = False # https://github.com/Pointcept/Pointcept/issues/249#issuecomment-2109206794
-batch_size = 8  # bs: total bs in all gpus
+# Measured, not guessed -- `python tools/find_batch_size.py`, which
+# runs a real fwd+bwd against the worst batch this pipeline can build
+# (batch_size x max_points points, the bound `LimitPoint` enforces).
+# On 2x Tesla V100-32GB (saturn14), budget 28.6 GiB at mem_frac=0.9:
+#   bs/gpu=1 -> 9.9 GiB reserved (35% of budget)
+#   bs/gpu=2 -> 19.2 GiB         (67%)   <- chosen
+#   bs/gpu=3 -> 29.3 GiB        (102%)   over
+# Needs PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (set in run_ribseg.sh)
+# to keep fragmentation out of that margin. Re-measure if the GPU changes; the
+# figures are dominated by the non-flash attention path, see enc_patch_size.
+batch_size = 4  # bs: total bs in all gpus (2 per GPU x 2 GPUs)
 batch_size_test = None  # auto adapt to bs 1 for each gpu
 epoch = 100
 eval_epoch = epoch
@@ -21,11 +31,18 @@ model = dict(
         enc_depths=(2, 2, 2, 6, 2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
-        enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        # Attention-window size per stage. The published (1024,)*5 assumes
+        # flash-attention; without it the fallback materialises the attention
+        # matrix and OOMs at batch size 1 even on a 32GB card. Memory here is
+        # linear in patch size, so shrink the shallow stages (huge N, only
+        # local shape needed) and keep 1024 at the deepest stage, where the
+        # cloud is ~409 points and one patch therefore spans the whole rib
+        # cage -- the global context that rib indexing actually depends on.
+        enc_patch_size=(128, 128, 256, 512, 1024),
         dec_depths=(2, 2, 2, 2),
         dec_channels=(64, 64, 128, 256),
         dec_num_head=(4, 4, 8, 16),
-        dec_patch_size=(1024, 1024, 1024, 1024),
+        dec_patch_size=(128, 128, 256, 512),
         mlp_ratio=4,
         qkv_bias=True,
         qk_scale=None,
@@ -35,7 +52,7 @@ model = dict(
         shuffle_orders=True,
         pre_norm=True,
         enable_rpe=False,
-        enable_flash=True,
+        enable_flash=False, # flash-attn needs Ampere+; V100 is SM70
         upcast_attention=False,
         upcast_softmax=False,
         cls_mode=False,
@@ -99,8 +116,10 @@ else:
 grid_size_mm = 3.0
 grid_size = grid_size_mm / global_radius # config coords are normalised by `global_radius`
 # Outlier guard only, above the observed max of 233k (train split: mean 139k,
-# std 37k, p99 224k), so it should never bind and never bias the density.
-# Lower it if a batch of unusually large volumes runs out of memory.
+# std 37k, p99 224k), so it never binds and never biases the density. It still
+# bounds the worst-case batch for `find_batch_size`; lowering it below ~233k to
+# buy a bigger batch does not pay here, since batch 3/GPU does not fit either
+# way, and clipping would bias the point density for nothing.
 max_points = 250000
 
 
