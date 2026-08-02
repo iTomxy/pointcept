@@ -1083,6 +1083,32 @@ class InstanceParser(object):
 
 
 @TRANSFORMS.register_module()
+class LimitPoint:
+    """randomly drop points only when the cloud exceeds `max_points`
+
+    Unlike `SamplePoint`, a cloud smaller than the limit is left untouched
+    instead of being padded with duplicated points. Place it after `GridSample`
+    to keep the density uniform while capping memory. It re-orders points, so
+    it invalidates a previously computed `inverse`.
+    """
+    def __init__(self, max_points):
+        assert max_points is None or max_points > 0
+        self.max_points = max_points
+
+    def __call__(self, data_dict):
+        if self.max_points is None:
+            return data_dict
+
+        assert "coord" in data_dict
+        npt = data_dict["coord"].shape[0]
+        if npt > self.max_points:
+            idx = np.random.choice(npt, self.max_points, replace=False)
+            data_dict = index_operator(data_dict, idx)
+
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class MatchRibSkeleton:
     """Match rib instance points to their closest skeleton/centreline point.
     This relies on the original instance IDs before InstanceParser to correctly
@@ -1276,6 +1302,50 @@ class NormalizeIntensity(object):
         if "intensity" in data_dict:
             data_dict[self.dest_key] = normalise_intensity(data_dict["intensity"], self.clip_percentile)
 
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class NormalizeIntensityCached:
+    """percentile-clipped z-score of the intensity, from PRE-COMPUTED statistics.
+
+    Same result as `NormalizeIntensity(clip_percentile=...)` would give on the
+    whole volume, but the four scalars come from the cache instead of being
+    recomputed. That matters because the statistics must describe the *whole*
+    volume: once the point cloud has been sieved to HU > threshold, they can no
+    longer be derived from the points at hand. Caching four floats per volume
+    rather than one float32 per point makes the cache ~22% smaller.
+
+    Beware what this feature actually carries. The upper clip sits near the
+    99.5th percentile of a mostly-air volume, i.e. ~500 HU, so 20-30% of the
+    kept bone points saturate to one value and cortical density is erased.
+    Within a volume the output spans ~0.2, while across volumes it spans ~2.5,
+    so it encodes which scan a point came from more than which tissue it is.
+    `WindowIntensity` is the better default; this exists to reproduce the old
+    `norm_intensity` field for comparison.
+    """
+    def __init__(self, src_key="intensity", dest_key="strength",
+                 stat_keys=("intensity_min", "intensity_max", "intensity_mean", "intensity_std")):
+        """
+        src_key: str = "intensity", field holding the raw HU value
+        dest_key: str = "strength", where to store the normalised value
+        stat_keys: str[4], data dict keys holding (clip_low, clip_high, mean, std)
+            of the clipped volume, as written by `preprocess_ptcloud`
+        """
+        assert len(stat_keys) == 4
+        self.src_key = src_key
+        self.dest_key = dest_key
+        self.stat_keys = tuple(stat_keys)
+
+    def __call__(self, data_dict):
+        if self.src_key not in data_dict:
+            return data_dict
+
+        missing = [k for k in self.stat_keys if k not in data_dict]
+        assert not missing, "{}: missing cached statistics {}".format(self.__class__.__name__, missing)
+        lo, hi, mean, std = (float(data_dict[k]) for k in self.stat_keys)
+        v = np.clip(data_dict[self.src_key].astype(np.float32), lo, hi)
+        data_dict[self.dest_key] = ((v - mean) / max(std, 1e-6)).astype(np.float32)
         return data_dict
 
 
@@ -1929,6 +1999,38 @@ class ReadNifti:
 
 
 @TRANSFORMS.register_module()
+class ReadNpz:
+    """Load a precomputed point-cloud .npz cache.
+    Replaces ReadNifti + NormalizeIntensity + CT2PointCloud. Expected npz keys:
+    affine, label, intensity, voxel_index, nifti_shape and the
+    intensity_{min,max,mean,std} scalars. Rebuild `coord` with ToPhysicalCoord.
+    See ribsegv2/preproc.preprocess_ptcloud.
+    `intensity` is a raw HU integer; turn it into a feature with `WindowIntensity`
+    (fixed window) or `NormalizeIntensityCached` (cached percentile z-score),
+    both of which cast to float themselves.
+    """
+    def __init__(self, path_key="npz", rename_keys={"label": "segment"}):
+        """
+        path_key: str = "npz", data_dict key that holds the .npz file path
+        rename_keys: Dict[str, str] = None, rename keys in the loaded npz file
+        """
+        self.path_key = path_key
+        self.rename_keys = rename_keys or {}
+
+    def __call__(self, data_dict):
+        path = data_dict.pop(self.path_key)
+        assert os.path.isfile(path), "{}: No such file: {}".format(self.__class__.__name__, path)
+        npz = np.load(path)
+
+        d = {k: npz[k] for k in npz.files}
+        for k_old, k_new in self.rename_keys.items():
+            if k_old in d:
+                d[k_new] = d.pop(k_old)
+        data_dict.update(d)
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class Reorient:
     """reorient a medical volume (3D voxel grids)"""
     def __init__(self, keys, new_ornt="LPS"):
@@ -1950,12 +2052,17 @@ class Reorient:
             # Get the transform from original to target orientation
             transform = ornt_transform(axcodes2ornt(old_ornt), axcodes2ornt(self.new_ornt))
             # Create new affine for the transformed image
-            affine = nib.orientations.inv_ornt_aff(transform, data_dict.pop("nifti_shape"))
+            orig_shape = data_dict.pop("nifti_shape")
+            affine = nib.orientations.inv_ornt_aff(transform, orig_shape)
             data_dict["affine"] = np.dot(data_dict["affine"], affine)
             assert nib.aff2axcodes(data_dict["affine"]) == self.new_ornt, \
                 "[{}] Orientation after transform {} does not match expection {}".format(
                     self.__class__.__name__, nib.aff2axcodes(data_dict["affine"]), self.new_ornt
                 )
+            # Reorientation can permute axes; retain the shape in the same
+            # orientation as the arrays and voxel_index produced downstream.
+            _, axis_order, _ = determine_reorient(old_ornt, self.new_ornt)
+            data_dict["nifti_shape"] = tuple(orig_shape[i] for i in axis_order)
 
         # data_dict["orientation"] = self.new_ornt
         return data_dict
@@ -2063,6 +2170,11 @@ class ToTensor(object):
         elif isinstance(data, np.ndarray) and np.issubdtype(data.dtype, bool):
             return torch.from_numpy(data)
         elif isinstance(data, np.ndarray) and np.issubdtype(data.dtype, np.integer):
+            if np.issubdtype(data.dtype, np.unsignedinteger) and data.size > 0:
+                # torch 1.x cannot construct tensors directly from uint16/32/64.
+                # torch.from_numpy accepts only uint8 among the unsigned types,
+                # but a cache narrowed by `np_smallest_dtype` holds uint16/uint32
+                data = data.astype(np.int64)
             return torch.from_numpy(data).long()
         elif isinstance(data, np.ndarray) and np.issubdtype(data.dtype, np.floating):
             return torch.from_numpy(data).float()
@@ -2080,6 +2192,12 @@ class ToTensor(object):
 class ToPhysicalCoord:
     """convert voxel indeices to physical space coordinates"""
     def __call__(self, data_dict):
+        # Backward compatibility for caches produced before affine replaced
+        # the derived coord array.
+        if "affine" not in data_dict:
+            assert "coord" in data_dict, \
+                "ToPhysicalCoord requires affine + voxel_index, or an existing coord"
+            return data_dict
         data_dict["coord"] = nib.affines.apply_affine(
             data_dict["affine"],
             data_dict["voxel_index"].astype(np.float32)
@@ -2203,6 +2321,21 @@ class TruncateRibPoint:
 
 
 @TRANSFORMS.register_module()
+class TypeCast:
+    """cast numpy array to a specific dtype"""
+    def __init__(self, key_type):
+        """key_type: Dict[str, NumpyTypeCode], e.g. {"intensity": "f4", "label": "i4"}"""
+        self.key_type = key_type
+
+    def __call__(self, data_dict):
+        for k, dt in self.key_type.items():
+            if k in data_dict:
+                data_dict[k] = data_dict[k].astype(dt)
+
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class Update(object):
     def __init__(self, keys_dict=None):
         if keys_dict is None:
@@ -2212,6 +2345,34 @@ class Update(object):
     def __call__(self, data_dict):
         for key, value in self.keys_dict.items():
             data_dict[key] = value
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class WindowIntensity:
+    """map raw HU to [0, 1] through a FIXED window shared by every volume.
+
+    Unlike `NormalizeIntensity`, the window is not derived from the volume being
+    processed, so the same HU always maps to the same feature value. Per-volume
+    percentile normalisation makes the feature depend on which other tissue
+    happened to be in the field of view.
+    """
+    def __init__(self, window=(200.0, 1500.0), src_key="intensity", dest_key="strength"):
+        """
+        window: float[2], (low, high) HU bounds; values outside are clipped
+        src_key: str = "intensity", field holding the raw HU value
+        dest_key: str = "strength", where to store the windowed value
+        """
+        assert len(window) == 2 and window[0] < window[1]
+        self.low, self.high = float(window[0]), float(window[1])
+        self.src_key = src_key
+        self.dest_key = dest_key
+
+    def __call__(self, data_dict):
+        if self.src_key in data_dict:
+            v = np.clip(data_dict[self.src_key].astype(np.float32), self.low, self.high)
+            data_dict[self.dest_key] = (v - self.low) / (self.high - self.low)
+
         return data_dict
 
 

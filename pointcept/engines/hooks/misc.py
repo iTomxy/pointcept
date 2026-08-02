@@ -200,7 +200,7 @@ class CheckpointSaver(HookBase):
                     "epoch": self.trainer.epoch + 1,
                     "state_dict": self.trainer.model.state_dict(),
                     "optimizer": self.trainer.optimizer.state_dict(),
-                    "scheduler": self.trainer.scheduler.state_dict(),
+                    "scheduler": None if self.trainer.scheduler is None else self.trainer.scheduler.state_dict(),
                     "scaler": (
                         self.trainer.scaler.state_dict()
                         if self.trainer.cfg.enable_amp
@@ -269,7 +269,8 @@ class CheckpointLoader(HookBase):
                 self.trainer.start_epoch = checkpoint["epoch"]
                 self.trainer.best_metric_value = checkpoint["best_metric_value"]
                 self.trainer.optimizer.load_state_dict(checkpoint["optimizer"])
-                self.trainer.scheduler.load_state_dict(checkpoint["scheduler"])
+                if self.trainer.scheduler is not None and checkpoint["scheduler"] is not None:
+                    self.trainer.scheduler.load_state_dict(checkpoint["scheduler"])
                 if self.trainer.cfg.enable_amp:
                     self.trainer.scaler.load_state_dict(checkpoint["scaler"])
         else:

@@ -6,6 +6,7 @@ Please cite our work if the code is helpful to you.
 """
 
 import os, math
+import contextlib
 import warnings
 from collections import abc
 import numpy as np
@@ -95,6 +96,53 @@ def vis_confusion_matrix(conf_matrix, classes_name, save_file, title='Normalized
     plt.close(fig)
 
 
+@contextlib.contextmanager
+def quiet_nan():
+    """silence the 0/0 and all-NaN warnings raised by deliberately NaN-producing code
+
+    Metrics use NaN to mark "not applicable to this sample" (e.g. a class absent
+    from a volume) so it drops out of an average instead of counting as zero.
+    Computing them therefore warns once per class per sample, which floods a log
+    for no reason. Wrap those calls in this rather than muting numpy globally.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            yield
+
+
+def nanmean(a, axis=None):
+    """numpy.nanmean that returns NaN instead of warning on an all-NaN slice"""
+    a = np.asarray(a, dtype=float)
+    valid = ~np.isnan(a)
+    total = np.where(valid, a, 0.0).sum(axis=axis)
+    count = valid.sum(axis=axis)
+    out = np.where(count > 0, total / np.clip(count, 1, None), np.nan)
+    return float(out) if np.ndim(out) == 0 else out
+
+
+def to_jsonable(obj):
+    """recursively cast numpy scalars & arrays to built-ins so json.dump cannot fail
+
+    Worth a defensive pass whenever the payload is assembled from several
+    helpers: numpy scalars (np.bool_ especially) are not JSON serialisable, and
+    a TypeError at dump time throws away everything that produced the payload.
+    """
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return to_jsonable(obj.tolist())
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    return obj
+
+
 def calc_stat(lst, percentages=[], prec=None, scale=None):
     """list of statistics: median, mean, standard error, min, max, percentiles
     It can be useful when you want to know these statistics of a list and
@@ -109,6 +157,14 @@ def calc_stat(lst, percentages=[], prec=None, scale=None):
     """
     if isinstance(scale, (int, float)):
         lst = list(map(lambda x: scale * x, lst))
+
+    if not np.isfinite(np.asarray(lst, dtype=float)).any():
+        # empty, or every entry is NaN: numpy would warn and return NaN anyway,
+        # so answer with the same shape of dict quietly
+        keys = ["min", "max", "mean", "std", "median"]
+        # same clamping as the normal path below, so the keys match
+        keys += ["p_{}".format(max(1e-7, min(p, 100 - 1e-7))) for p in percentages]
+        return {k: math.nan for k in keys}
 
     ret = {
         "min": float(np.nanmin(lst)),

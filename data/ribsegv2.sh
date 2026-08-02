@@ -48,14 +48,15 @@ done
 
 
 echo preprocessed image \& label
-dname=pt_preproc
-ln -s $src/$dname $dst/$dname
+for dname in reproc_crop  pt_preproc; do
+    ln -s $src/$dname $dst/$dname
+done
 
 
-echo link binary fg-bg prediction
-bp_p=$HOME/codes/tmp.ptcloud/log/ribsegv2/semseg-dgcnn-bin-rndapply/recon-3d-binpred
-# bp_p=../exp/ribsegv2/semseg-pt_v3m1_0_base-bin/recon-3d-binpred
-ln -s `realpath $bp_p` $dst/binpred
+# echo link binary fg-bg prediction
+# bp_p=$HOME/codes/tmp.ptcloud/log/ribsegv2/semseg-dgcnn-bin-rndapply/recon-3d-binpred
+# # bp_p=../exp/ribsegv2/semseg-pt_v3m1_0_base-bin/recon-3d-binpred
+# ln -s `realpath $bp_p` $dst/binpred
 
 
 cd $dst

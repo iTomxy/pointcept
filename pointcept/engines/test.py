@@ -10,9 +10,7 @@ from uuid import uuid4
 import os
 import time
 import numpy as np
-import sklearn
-import nibabel as nib
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -30,11 +28,9 @@ from pointcept.utils.misc import (
     intersection_and_union_gpu,
     make_dirs,
     vis_confusion_matrix,
-    to_dict, calc_stat, bootstrap_ci_mean_delta,
+    to_dict, calc_stat, nanmean, quiet_nan, to_jsonable, np_smallest_dtype,
 )
 from pointcept.utils.eval_cm import *
-from pointcept.utils import eval_cluster
-from pointcept.utils.ins2sem import relabel_ribs_anatomical
 
 try:
     import pointops
@@ -365,647 +361,6 @@ class SemSegTester(TesterBase):
     @staticmethod
     def collate_fn(batch):
         return batch
-
-
-@TESTERS.register_module()
-class SemSegTester2(SemSegTester):
-    """(28 Sept 2025, iTom) adajusted simpler"""
-    def test(self):
-        assert self.test_loader.batch_size == 1
-        logger = get_root_logger()
-        logger.info(">>>>>>>>>>>>>>>> Start SemSegTester2 Evaluation >>>>>>>>>>>>>>>>")
-
-        # batch_time = AverageMeter()
-        tp_meter = AverageMeter()
-        tn_meter = AverageMeter()
-        fp_meter = AverageMeter()
-        fn_meter = AverageMeter()
-        self.model.eval()
-
-        # save_path = os.path.join(self.cfg.save_path, "result")
-        # make_dirs(save_path)
-        comm.synchronize()
-        record = {}
-        # fragment inference
-        for idx, data_dict in enumerate(self.test_loader):
-            # start = time.time()
-            data_dict = data_dict[0]  # current assume batch size is 1
-            for key in data_dict.keys():
-                if isinstance(data_dict[key], torch.Tensor):
-                    data_dict[key] = data_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
-                output_dict = self.model(data_dict)
-            # fragment_list = data_dict.pop("fragment_list")
-            pred = output_dict["seg_logits"].max(1)[1]#.cpu().numpy()
-            segment = data_dict.pop("segment")#.cpu().numpy()
-            data_name = data_dict.pop("name")
-            # pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
-            tp, tn, fp, fn = confusion_matrix(
-                pred,
-                segment,
-                self.cfg.data.num_classes,
-                self.cfg.data.ignore_index,
-            )
-            tp, tn, fp, fn = tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy()
-            tp_meter.update(tp)
-            tn_meter.update(tn)
-            fp_meter.update(fp)
-            fn_meter.update(fn)
-            record[data_name] = dict(
-                # intersection=intersection, union=union, target=target
-                tp=tp, tn=tn, fp=fp, fn=fn
-            )
-            print(idx, end='\r')
-
-        logger.info("Syncing ...")
-        comm.synchronize()
-        record_sync = comm.gather(record, dst=0)
-
-        if comm.is_main_process():
-            record = {}
-            for _ in range(len(record_sync)):
-                r = record_sync.pop()
-                record.update(r)
-                del r
-            # intersection = np.sum(
-            #     [meters["intersection"] for _, meters in record.items()], axis=0
-            # )
-            # union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
-            # target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
-            tp = np.sum([meters["tp"] for _, meters in record.items()], axis=0)
-            tn = np.sum([meters["tn"] for _, meters in record.items()], axis=0)
-            fp = np.sum([meters["fp"] for _, meters in record.items()], axis=0)
-            fn = np.sum([meters["fn"] for _, meters in record.items()], axis=0)
-
-            # if self.cfg.data.test.type == "S3DISDataset":
-            #     torch.save(
-            #         dict(intersection=intersection, union=union, target=target),
-            #         os.path.join(save_path, f"{self.test_loader.dataset.split}.pth"),
-            #     )
-
-            metrics = calc_cm_metrics(tp, tn, fp, fn,
-                self.cfg.data.num_classes, self.cfg.data.ignore_index)
-            with open(os.path.join(
-                self.cfg.save_path, "test-{}.json".format(self.__class__.__name__)
-            ), 'w') as f:
-                json.dump({
-                    "time": time.asctime(time.gmtime()),
-                    "metrics": metrics,
-                    "args": to_dict(self.cfg),
-                }, f, indent=1)
-            for k, v in metrics.items():
-                logger.info("{}: {}".format(k, v))
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-
-
-@TESTERS.register_module()
-class SemSegVolumeTester(SemSegTester):
-    """(9 Jan 2026, iTom) volume-wise test"""
-    def __init__(self, cfg, save_pred, *args, **kwargs):
-        self.save_pred = save_pred
-        super().__init__(cfg, *args, **kwargs)
-
-    def build_test_loader(self):
-        return build_dataset(self.cfg.data.test)
-
-    def test(self):
-        assert 1 == self.cfg.batch_size_test_per_gpu
-        logger = get_root_logger()
-        logger.info(">>>>>>>>>>>>>>>> Start SemSegVolumeTester Evaluation >>>>>>>>>>>>>>>>")
-        self.model.eval()
-        if self.save_pred:
-            save_path = os.path.join(self.cfg.save_path, "result")
-            make_dirs(save_path)
-
-        comm.synchronize()
-        metrics_sum = None # accumulate class-wise metrics, then reduce at last in main process
-        for vol_dset in self.test_loader:
-            vol_loader = torch.utils.data.DataLoader(
-                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
-                pin_memory=True, collate_fn=self.__class__.collate_fn)
-            pred_dict = self.pred_volume(vol_loader)
-            if self.save_pred:
-                np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
-
-            pred = pred_dict["pred"]#.reshape(-1)
-            label = pred_dict["label"]#.reshape(-1)
-            tp, tn, fp, fn = confusion_matrix(
-                torch.LongTensor(pred).cuda(non_blocking=True),
-                torch.LongTensor(label).cuda(non_blocking=True),
-                self.cfg.data.num_classes,
-            )
-            m = clswise_cm_metrics_dist(tp, tn, fp, fn)
-            if metrics_sum is None:
-                metrics_sum = m
-            else:
-                for k in m.keys():
-                    metrics_sum[k]["sum"] += m[k]["sum"]
-                    metrics_sum[k]["count"] += m[k]["count"]
-
-            print(vol_dset.volume_id, end='\r')
-
-        logger.info("Syncing ...")
-        comm.synchronize()
-        # Now reduce across all processes ONCE after processing all batches
-        if comm.get_world_size() > 1:
-            # pack everything into a list of tensors to reduce
-            tensors_to_reduce = []
-            for m in metrics_sum:
-                tensors_to_reduce.append(metrics_sum[m]["sum"])
-                tensors_to_reduce.append(metrics_sum[m]["count"])
-            # Reduce everything at once (Summing across GPUs)
-            for t in tensors_to_reduce:
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
-        if comm.is_main_process():
-            metrics = {}
-            for k, d in metrics_sum.items():
-                _sum = d["sum"]
-                _count = d["count"]
-                _clswise = (_sum / torch.clamp(_count, min=1))
-                _valid = torch.ones_like(_clswise)
-                _valid[self.cfg.data.bg_class] = 0
-                metrics[k] = _clswise[_valid > 0].mean().item()
-                metrics[k+"_class"] = _clswise.cpu().numpy().tolist()
-
-            with open(os.path.join(
-                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
-            ), 'w') as f:
-                json.dump({
-                    "time": time.asctime(time.gmtime()),
-                    "epoch": self.ckpt_epoch,
-                    "metrics": metrics,
-                    "args": to_dict(self.cfg),
-                }, f, indent=1)
-            for k, v in metrics.items():
-                logger.info("{}: {}".format(k, v))
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-
-    def pred_volume(self, vol_loader):
-        """calculate the prediction 3D voxel grid
-        Default value is -1 (not predicted voxels, should be ignored).
-        """
-        pred_list, label_list, index_list, coord_list = [], [], [], []
-        # Num points for each batch (batch size = 1)
-        # Record this cuz GridSample makes each batch have different npt,
-        # so the result cannot be stored in a [bs, npt, ...] format, but
-        # serialised to [npt_1 + ... + npt_k, ...] format. This can reconstruct
-        # each batch if wanted, e.g. in error analysing.
-        batch_npt = []
-        for i, batch in enumerate(vol_loader):
-            print(i, end='\r')
-            batch = batch[0] # current assume batch size is 1
-            for key in batch.keys():
-                if isinstance(batch[key], torch.Tensor):
-                    # print(key, batch[key].size())
-                    batch[key] = batch[key].cuda(non_blocking=True)
-
-            with torch.no_grad():
-                output_dict = self.model(batch) # [bs, seg_num_all, #points]
-
-            pred_list.append(output_dict["seg_logits"].max(1)[1].cpu().numpy()) # already [#points]
-            label_list.append(batch["segment"].cpu().numpy()) # already [#points]
-            coord_list.append(batch["coord"].cpu().numpy()) # already [#points, 3]
-            index_list.append(batch["voxel_index"].cpu().numpy().astype(int)) # already [#points, 3]
-            batch_npt.append(batch["segment"].size(0))
-
-        assert sum(batch_npt) == sum(len(pred) for pred in pred_list) == \
-            sum(len(label) for label in label_list) == \
-            sum(len(coord) for coord in coord_list) == \
-            sum(len(index) for index in index_list)
-        return {
-            "pred": np.concatenate(pred_list), # [#points]
-            "label": np.concatenate(label_list), # [#points]
-            "coord": np.concatenate(coord_list), # [#points, 3+?]
-            "voxel_index": np.concatenate(index_list), # [#points, 3]
-            "batch_npt": np.asarray(batch_npt), # [#batches]
-        }
-
-
-@TESTERS.register_module()
-class SemSegVolumeTesterOverlap(SemSegVolumeTester):
-    """Volume-wise tester that merges overlapping patch predictions by voxel index.
-
-    For duplicated voxels coming from overlapping patches, this averages the raw
-    logits before taking argmax, which is more stable than voting on hard labels.
-    """
-
-    def pred_volume(self, vol_loader):
-        logits_list, label_list, index_list, coord_list = [], [], [], []
-        batch_npt = []
-        for i, batch in enumerate(vol_loader):
-            print(i, end='\r')
-            batch = batch[0]  # current assume batch size is 1
-            for key in batch.keys():
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].cuda(non_blocking=True)
-
-            with torch.no_grad():
-                output_dict = self.model(batch)
-
-            logits_list.append(output_dict["seg_logits"].cpu().numpy())  # [#points, #classes]
-            label_list.append(batch["segment"].cpu().numpy())  # [#points]
-            coord_list.append(batch["coord"].cpu().numpy())  # [#points, 3]
-            index_list.append(batch["voxel_index"].cpu().numpy().astype(np.int64))  # [#points, 3]
-            batch_npt.append(batch["segment"].size(0))
-
-        assert sum(batch_npt) == sum(logits.shape[0] for logits in logits_list) == \
-            sum(len(label) for label in label_list) == \
-            sum(len(coord) for coord in coord_list) == \
-            sum(len(index) for index in index_list)
-
-        logits = np.concatenate(logits_list, axis=0)
-        label = np.concatenate(label_list, axis=0)
-        coord = np.concatenate(coord_list, axis=0)
-        voxel_index = np.concatenate(index_list, axis=0)
-
-        unique_index, first_idx, inverse, counts = np.unique(
-            voxel_index, axis=0, return_index=True, return_inverse=True, return_counts=True
-        )
-        logits_merged = np.zeros((unique_index.shape[0], logits.shape[1]), dtype=np.float64)
-        np.add.at(logits_merged, inverse, logits)
-        logits_merged /= counts[:, None]
-
-        coord_merged = coord[first_idx]
-        label_merged = label[first_idx]
-        pred_merged = logits_merged.argmax(1).astype(label_merged.dtype, copy=False)
-
-        return {
-            "pred": pred_merged, # [#unique_points]
-            "label": label_merged, # [#unique_points]
-            "coord": coord_merged, # [#unique_points, 3+?]
-            "voxel_index": unique_index, # [#unique_points, 3]
-            "logit": logits_merged, # [#unique_points, #classes]
-            "count": counts, # [#unique_points]
-            "batch_npt": np.asarray(batch_npt), # [#patches]
-        }
-
-
-@TESTERS.register_module()
-class SemSegVolumeTester1Gpu(SemSegVolumeTester):
-    """(19 Feb 2026, iTom) ensure 1 GPU is used"""
-    def test(self):
-        assert 1 == comm.get_world_size(), "world size: {} > 1".format(comm.get_world_size())
-        assert 1 == self.cfg.batch_size_test_per_gpu
-        logger = get_root_logger()
-        logger_vol = get_logger( # datum-wise logger
-            "SemSegVolumeTester1Gpu-vol",
-            log_file=os.path.join(self.cfg.save_path, "{}-{}-vol.log".format(self.cfg.data.test.split, self.__class__.__name__)),
-            fmt="%(message)s"
-        )
-        logger_vol.info(json.dumps({"time": time.asctime(time.gmtime())}))
-        # logger_batch = get_logger( # batch-wise logger
-        #     "SemSegVolumeTester1Gpu-batch",
-        #     log_file=os.path.join(self.cfg.save_path, "{}-{}-batch.log".format(self.cfg.data.test.split, self.__class__.__name__)),
-        #     fmt="%(message)s"
-        # )
-        # logger_batch.info(json.dumps({"time": time.asctime(time.gmtime())}))
-        logger.info(">>>>>>>>>>>>>>>> Start {} Evaluation >>>>>>>>>>>>>>>>".format(self.__class__.__name__))
-        self.model.eval()
-        if self.save_pred:
-            save_path = os.path.join(self.cfg.save_path, "result")
-            make_dirs(save_path)
-
-        # valid_cls_mask = torch.ones(self.cfg.data.num_classes, dtype=torch.bool).cuda(non_blocking=True)
-        # valid_cls_mask[self.cfg.data.bg_class] = False
-
-        # comm.synchronize()
-        records = defaultdict(list)
-        for vol_dset in self.test_loader:
-            vol_loader = torch.utils.data.DataLoader(
-                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
-                pin_memory=True, collate_fn=self.__class__.collate_fn)
-            pred_dict = self.pred_volume(vol_loader)
-            if self.save_pred:
-                np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
-
-            tp, tn, fp, fn = confusion_matrix(
-                torch.LongTensor(pred_dict["pred"]),#.cuda(non_blocking=True),
-                torch.LongTensor(pred_dict["label"]),#.cuda(non_blocking=True),
-                self.cfg.data.num_classes
-            )
-            m = calc_cm_metrics(tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
-            m.update(error_rate(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
-            m.update(error_rate_rib(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
-            logger_vol.info(json.dumps({
-                "vid": vol_dset.volume_id,
-                "metrics": m,
-            }))
-            for k, v in m.items():
-                if isinstance(v, float):
-                    records[k].append(v)
-
-            print(vol_dset.volume_id, end='\r')
-
-        if comm.is_main_process():
-            metrics = {k: calc_stat(v) for k, v in records.items()}
-            with open(os.path.join(
-                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
-            ), 'w') as f:
-                json.dump({
-                    "time": time.asctime(time.gmtime()),
-                    "epoch": self.ckpt_epoch,
-                    "metrics": metrics,
-                    "args": to_dict(self.cfg),
-                }, f, indent=1)
-            for k, v in metrics.items():
-                logger.info("{}: {}".format(k, v))
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-
-
-@TESTERS.register_module()
-class SemSegVolumeTesterOverlap1Gpu(SemSegVolumeTesterOverlap):
-    """Single-GPU overlap-aware version of `SemSegVolumeTester1Gpu`."""
-    def test(self):
-        assert 1 == comm.get_world_size(), "world size: {}".format(comm.get_world_size())
-        assert 1 == self.cfg.batch_size_test_per_gpu
-        logger = get_root_logger()
-        logger_vol = get_logger(
-            "SemSegVolumeTesterOverlap1Gpu-vol",
-            log_file=os.path.join(self.cfg.save_path, "{}-{}-vol.log".format(self.cfg.data.test.split, self.__class__.__name__)),
-            fmt="%(message)s"
-        )
-        logger_vol.info(json.dumps({"time": time.asctime(time.gmtime())}))
-        logger.info(">>>>>>>>>>>>>>>> Start {} Evaluation >>>>>>>>>>>>>>>>".format(self.__class__.__name__))
-        self.model.eval()
-        if self.save_pred:
-            save_path = os.path.join(self.cfg.save_path, "result")
-            make_dirs(save_path)
-
-        comm.synchronize()
-        records = defaultdict(list)
-        for vol_dset in self.test_loader:
-            vol_loader = torch.utils.data.DataLoader(
-                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
-                pin_memory=True, collate_fn=self.__class__.collate_fn)
-            pred_dict = self.pred_volume(vol_loader)
-            if self.save_pred:
-                np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
-
-            tp, tn, fp, fn = confusion_matrix(
-                torch.LongTensor(pred_dict["pred"]),
-                torch.LongTensor(pred_dict["label"]),
-                self.cfg.data.num_classes
-            )
-            m = calc_cm_metrics(tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
-            m.update(error_rate(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
-            m.update(error_rate_rib(pred_dict["pred"], pred_dict["label"], self.cfg.data.bg_class))
-            logger_vol.info(json.dumps({
-                "vid": vol_dset.volume_id,
-                "metrics": m,
-            }))
-            for k, v in m.items():
-                if isinstance(v, float):
-                    records[k].append(v)
-
-            print(vol_dset.volume_id, end='\r')
-
-        if comm.is_main_process():
-            metrics = {k: calc_stat(v) for k, v in records.items()}
-            with open(os.path.join(
-                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
-            ), 'w') as f:
-                json.dump({
-                    "time": time.asctime(time.gmtime()),
-                    "epoch": self.ckpt_epoch,
-                    "metrics": metrics,
-                    "args": to_dict(self.cfg),
-                }, f, indent=1)
-            for k, v in metrics.items():
-                logger.info("{}: {}".format(k, v))
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-
-
-@TESTERS.register_module()
-class SemSegVolumeTesterCmpTrunc(SemSegVolumeTester):
-    """(21 Feb 2026, iTom) compared with full volume w/o truncation:
-    to eliminate the truncation-induced metric change and
-    test whether truncation lets the model perform worse.
-
-    Compare at volume-level.
-
-    Assume the transform does NOT include TruncateRibPoint,
-    so the raw batch are sampled from the intact volume, and
-    this class will deal with truncation itself.
-    """
-    def __init__(self, cfg, drop_depth, begin_from='i', pos='m', is_axis=2, min_npt=789, *args, **kwargs):
-        """mimic `TruncateRibPoint`"""
-        super().__init__(cfg, *args, **kwargs)
-
-        rib_pairs = tuple((i, i+12) for i in range(1, 12+1))
-        drop_depth = int(drop_depth)
-        assert 1 <= drop_depth <= len(rib_pairs) - 1
-
-        self.begin_from = begin_from.lower()
-        if 's' == self.begin_from: # from S (top) to I (bottom)
-            self.anchor_rib_pair = torch.LongTensor(rib_pairs[drop_depth - 1])
-            self.keep_ribs = torch.LongTensor(rib_pairs[drop_depth: ]).flatten() # used for judgement in case anchor rib pair does not exist
-        elif 'i' == self.begin_from: # from I (bottom) to S (top)
-            self.anchor_rib_pair = torch.LongTensor(rib_pairs[- drop_depth])
-            self.keep_ribs = torch.LongTensor(rib_pairs[: - drop_depth]).flatten() # used for judgement in case anchor rib pair does not exist
-        else:
-            raise ValueError("{}: Unsupport `begin_from`: expect {}, got {}".format(
-                self.__class__.__name__, ('s', 'i'), self.begin_from
-            ))
-
-        self.keep_ribs = torch.cat([self.keep_ribs, torch.LongTensor([0])]) # keep BG points
-
-        self.anchor_rib_pair = self.anchor_rib_pair.cuda(non_blocking=True)
-        self.keep_ribs = self.keep_ribs.cuda(non_blocking=True)
-
-        self.pos = pos.lower()
-        valid_pos = (
-            'b', # truncate at rib boundary
-            'm', # at middle
-        )
-        assert self.pos in valid_pos, "{}: Unsupport `pos`: expect {}, got {}".format(
-            self.__class__.__name__, valid_pos, self.pos
-        )
-
-        self.is_axis = is_axis
-        self.min_npt = min_npt
-
-    def test(self):
-        assert 1 == comm.get_world_size()
-        assert 1 == self.cfg.batch_size_test_per_gpu
-        # print(self.cfg.batch_size_test_per_gpu, self.cfg.batch_size_test)
-        logger = get_root_logger()
-        logger_vol = get_logger( # datum-wise logger
-            "{}-vol".format(self.__class__.__name__),
-            log_file=os.path.join(self.cfg.save_path, "{}-{}-vol.log".format(self.cfg.data.test.split, self.__class__.__name__)),
-            fmt="%(message)s",
-            # file_mode='w',
-        )
-        logger_vol.info(json.dumps({"time": time.asctime(time.gmtime())}))
-        logger.info(">>>>>>>>>>>>>>>> Start {} Evaluation >>>>>>>>>>>>>>>>".format(self.__class__.__name__))
-        self.model.eval()
-        if self.save_pred:
-            save_path = os.path.join(self.cfg.save_path, "result")
-            make_dirs(save_path)
-
-        comm.synchronize()
-        records = defaultdict(list) # for intact/raw volume
-        records_trunc = defaultdict(list) # for truncated volume
-        records_delta = defaultdict(list) # for delta between intact and truncated
-        for vol_dset in self.test_loader:
-            vol_loader = torch.utils.data.DataLoader(
-                vol_dset, batch_size=self.cfg.batch_size_test_per_gpu, shuffle=False, num_workers=self.cfg.batch_size_test_per_gpu,
-                pin_memory=True, collate_fn=self.__class__.collate_fn)
-            # pred_dict = self.pred_volume(vol_loader)
-            # if self.save_pred:
-            #     np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **pred_dict)
-            pred_list, pred_trunc_list, label_trunc_list = [], [], []
-            for i, batch in enumerate(vol_loader):
-                print(i, end='\r')
-                batch = batch[0] # current assume batch size is 1
-                for key in batch.keys():
-                    if isinstance(batch[key], torch.Tensor):
-                        # if "offset" == key:
-                        #     print(key, batch[key].size(), batch[key])
-                        # else:
-                        #     print(key, batch[key].size())
-
-                        # coord torch.Size([13392, 3])
-                        # grid_coord torch.Size([13392, 3])
-                        # segment torch.Size([13392])
-                        # voxel_index torch.Size([13392, 3])
-                        # offset torch.Size([1]) tensor([13392])
-                        # feat torch.Size([13392, 1])
-                        batch[key] = batch[key].cuda(non_blocking=True)
-
-                trunc_mask = self.mask(batch["coord"], batch["segment"])
-                if not trunc_mask.any():
-                    # too few points left after truncation -> skip
-                    continue
-
-                with torch.no_grad():
-                    # 1. full input, truncate prediction
-                    output_dict = self.model(batch)
-                    pred = output_dict["seg_logits"].max(1)[1]
-                    # print("pred:", pred.size()) # [npt]
-                    pred = pred[trunc_mask].cpu().numpy() # truncate prediction
-                    pred_list.append(pred)
-
-                    # 2. truncated input
-                    batch_trunc = {
-                        k: v[trunc_mask]
-                        if isinstance(v, torch.Tensor) and k in ("coord", "grid_coord", "segment", "feat")#, "voxel_index")
-                        else v
-                        for k, v in batch.items()
-                    }
-                    npt = batch_trunc["coord"].size(0)
-                    batch_trunc["offset"] = torch.tensor([npt], device=batch_trunc["coord"].device, dtype=batch["offset"].dtype) # update offset
-                    pred_trunc = self.model(batch_trunc)["seg_logits"].max(1)[1].cpu().numpy()
-                    # print("pred_trunc:", pred_trunc.shape) # [npt]
-                    label_trunc = batch_trunc["segment"].cpu().numpy()
-                    pred_trunc_list.append(pred_trunc)
-                    label_trunc_list.append(label_trunc)
-
-            # concatenate batches to be volume-level pred/label
-            if len(pred_list) == 0 or len(pred_trunc_list) == 0:
-                # in case no valid batch (after truncation) in this volume, skip this volume
-                # should not happen
-                logger_vol.info(json.dumps({
-                    "vid": vol_dset.volume_id,
-                    "msg": "skipped cuz no valid batch after truncation",
-                }))
-                continue
-
-            pred = np.concatenate(pred_list)
-            pred_trunc = np.concatenate(pred_trunc_list)
-            label_trunc = np.concatenate(label_trunc_list)
-
-            # test truncated prediction of intact/full volume
-            log_dict = {"vid": vol_dset.volume_id}
-            tp, tn, fp, fn = confusion_matrix(
-                torch.LongTensor(pred),
-                torch.LongTensor(label_trunc),
-                self.cfg.data.num_classes
-            )
-            m = calc_cm_metrics(tp.numpy(), tn.numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
-            m.update(error_rate(pred, label_trunc, self.cfg.data.bg_class))
-            m.update(error_rate_rib(pred, label_trunc, self.cfg.data.bg_class))
-            log_dict["metrics"] = m
-            for k, v in m.items():
-                if isinstance(v, float):
-                    records[k].append(v)
-
-            # test truncated input
-            tp, tn, fp, fn = confusion_matrix(
-                torch.LongTensor(pred_trunc), # here
-                torch.LongTensor(label_trunc),
-                self.cfg.data.num_classes
-            )
-            m = calc_cm_metrics(tp.numpy(), tn.numpy(), fp.cpu().numpy(), fn.cpu().numpy(), self.cfg.data.num_classes, self.cfg.data.bg_class)
-            m.update(error_rate(pred_trunc, label_trunc, self.cfg.data.bg_class)) # here
-            m.update(error_rate_rib(pred_trunc, label_trunc, self.cfg.data.bg_class)) # here
-            log_dict["metrics_trunc"] = m
-            for k, v in m.items():
-                if isinstance(v, float):
-                    records_trunc[k].append(v)
-
-            # delta
-            log_dict["metrics_delta"] = {}
-            for k in records.keys():
-                log_dict["metrics_delta"][k] = records[k][-1] - records_trunc[k][-1]
-                records_delta[k].append(log_dict["metrics_delta"][k])
-
-            logger_vol.info(json.dumps(log_dict))
-            print(vol_dset.volume_id, end='\r')
-
-        if comm.is_main_process():
-            metrics = {k: calc_stat(v) for k, v in records.items()}
-            metrics_trunc = {k: calc_stat(v) for k, v in records_trunc.items()}
-            metrics_delta = {}
-            for k, v in records_delta.items():
-                metrics_delta[k] = calc_stat(v)
-                metrics_delta[k+"-ci_95%"] = bootstrap_ci_mean_delta(v, alpha=0.05)
-
-            with open(os.path.join(
-                self.cfg.save_path, "{}-{}.json".format(self.cfg.data.test.split, self.__class__.__name__)
-            ), 'w') as f:
-                json.dump({
-                    "time": time.asctime(time.gmtime()),
-                    "epoch": self.ckpt_epoch,
-                    "metrics": metrics,
-                    "metrics_trunc": metrics_trunc,
-                    "metrics_delta": metrics_delta,
-                    "args": to_dict(self.cfg),
-                }, f, indent=1)
-            for k, v in metrics.items():
-                logger.info("{}: {}".format(k, v))
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-
-    def mask(self, coord, segment):
-        """
-        Args:
-            coord: float[npt, 3]
-            segment: int[npt]
-        Returns:
-            mask: bool[npt]
-        """
-        anchor_mask = torch.isin(segment, self.anchor_rib_pair)
-        if not anchor_mask.any(): # anchor rib does not exist
-            mask = torch.isin(segment, self.keep_ribs)
-        else:
-            anchor_coord = coord[anchor_mask] # [m, 3+?]
-            if 'm' == self.pos:
-                cut_z = anchor_coord[:, self.is_axis].mean()
-            elif 's' == self.begin_from: # truncate Superior, keep Inferior
-                cut_z = anchor_coord[:, self.is_axis].min() # lower boundary to remove anchor rib
-            else: # truncate Inferior, keep Superior
-                cut_z = anchor_coord[:, self.is_axis].max() # upper boundary to remove anchor rib
-
-            if 's' == self.begin_from: # truncate Superior (larger), keep Inferior (smaller)
-                mask = coord[:, self.is_axis] < cut_z
-            else: # truncate Inferior, keep Superior
-                mask = coord[:, self.is_axis] > cut_z
-
-        if mask.sum().item() < self.min_npt:
-            # too few points -> should ignore this batch
-            mask.fill_(False)
-
-        return mask
 
 
 @TESTERS.register_module()
@@ -1984,269 +1339,262 @@ class InsSegTester(TesterBase):
 
 
 @TESTERS.register_module()
-class InsSegTester2(InsSegTester):
-    """(7 Oct 2025, iTom) modified from InsSegTester
-    1. use `segment` and `instance` instead of the `origin_*` variant
-    2. don't reverse with `pointops.knn_query`
+class Ribsegv2VolumeTester(TesterBase):
+    """(1 Aug 2026, iTom) volume-wise test for grid-subsampled RibSeg v2.
+
+    One forward pass per volume: the model sees the grid-subsampled cloud
+    (~1e5 points), and `GridSample`'s `inverse` scatters that prediction back
+    over all ~2e6 original points, so every point is scored at full resolution.
+    This needs the test pipeline to `Copy` the label and voxel index into
+    `origin_segment` / `origin_voxel_index` before `GridSample` and to collect
+    `inverse`; see `Ribsegv2VolumeDataset`.
+
+    Every metric is aggregated ACROSS VOLUMES, never across points or batches:
+    each volume contributes one value per class, so a 3e6-point scan and a
+    1e6-point scan weigh the same. Classes absent from a volume stay NaN and
+    drop out of that volume's average rather than counting as zero.
     """
-    def test(self):
-        assert self.test_loader.batch_size == 1
-        logger = get_root_logger()
-        logger.info(">>>>>>>>>>>>>>>> Start InsSegTester Evaluation >>>>>>>>>>>>>>>>")
 
-        batch_time = AverageMeter()
+    DEFAULT_METRICS = ("dice", "iou", "precision", "recall", "specificity", "accuracy")
+    N_RIB_CLASSES = 1 + 24 # background + rib1..rib24, what the rib-specific metrics assume
 
-        self.model.eval()
-        scenes = []
-
-        for idx, data_dict in enumerate(self.test_loader):
-            start = time.time()
-            data_name = data_dict.pop("name")
-            for key in data_dict.keys():
-                if isinstance(data_dict[key], torch.Tensor):
-                    data_dict[key] = data_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
-                output_dict = self.model(data_dict)
-
-            segment = data_dict["segment"]#["origin_segment"]
-            instance = data_dict["instance"]#["origin_instance"]
-
-            # if "origin_coord" in data_dict.keys():
-            #     # (7 Oct 2025, iTom) BUG: Since `GridSample` uses `index_operator`,
-            #     # which re-indexes, thus re-orders, points, this 1-nn (closest)
-            #     # point matching seems aiming at recovering the point order.
-            #     # However, since `coord` is distorted in data augmentation,
-            #     # while `origin_coord` is NOT, they are NOT in the same coordinate
-            #     # space anymore, so this matching does NOT work as expected.
-            #     reverse, _ = pointops.knn_query(
-            #         1,
-            #         data_dict["coord"].float(),
-            #         data_dict["offset"].int(),
-            #         data_dict["origin_coord"].float(),
-            #         data_dict["origin_offset"].int(),
-            #     )
-            #     reverse = reverse.cpu().flatten().long()
-            #     output_dict["pred_masks"] = output_dict["pred_masks"][:, reverse]
-            #     segment = data_dict["origin_segment"]
-            #     instance = data_dict["origin_instance"]
-
-            gt_instances, pred_instance = self.associate_instances(
-                output_dict, segment, instance
-            )
-
-            scenes.append(dict(gt=gt_instances, pred=pred_instance))
-            batch_time.update(time.time() - start)
-            logger.info(
-                "Test: {} [{}/{}] "
-                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) ".format(
-                    data_name,
-                    idx + 1,
-                    len(self.test_loader),
-                    batch_time=batch_time,
-                )
-            )
-            if self.cfg.data.test.type == "ScanNetPPDataset":
-                self.write_scannetpp_results(
-                    output_dict["pred_scores"],
-                    output_dict["pred_masks"],
-                    output_dict["pred_classes"],
-                    data_name,
-                )
-
-            if self.save_pred:
-                save_dir = os.path.join(self.cfg.save_path, "result")
-                os.makedirs(save_dir, exist_ok=True)
-                save_dict = {k: v.cpu().numpy() for k, v in output_dict.items() if isinstance(v, torch.Tensor)}
-                save_dict.update({k: v.cpu().numpy() for k, v in data_dict.items() if isinstance(v, torch.Tensor)})
-                save_dict.update({"gt_instances": gt_instances, "pred_instance": pred_instance})
-                np.savez_compressed(os.path.join(save_dir, "InsSeg2-{}.npz".format(data_name)), **save_dict)
-
-        comm.synchronize()
-        scenes_sync = comm.gather(scenes, dst=0)
-        scenes = [scene for scenes_ in scenes_sync for scene in scenes_]
-        ap_scores = self.evaluate_matches(scenes)
-        all_ap = ap_scores["all_ap"]
-        all_ap_50 = ap_scores["all_ap_50%"]
-        all_ap_25 = ap_scores["all_ap_25%"]
-        logger.info(
-            "Val result: mAP/AP50/AP25 {:.4f}/{:.4f}/{:.4f}.".format(
-                all_ap, all_ap_50, all_ap_25
-            )
+    def __init__(self, cfg, save_pred=False, metrics=None, save_cm=True, rib_metrics=None,
+                 model=None, test_loader=None, verbose=False):
+        """
+        save_pred: bool = False, dump full-resolution predictions as {save_path}/result/{vid}.npz
+        metrics: List[str] = None, subset of SemSegEvaluator.METRICS; None -> DEFAULT_METRICS
+        save_cm: bool = True, dump & plot the aggregated [C, C] confusion matrix
+        rib_metrics: bool = None, also report the rib-index metrics (shift rates,
+            label accuracy, off-by-one confusion). They hard-code the 25-class
+            rib set, so None auto-enables them only for that class count -- leave
+            it alone unless you know better. Stage-1 rib vs. non-rib has nothing
+            to shift between, and the class-wise lists would be the wrong length.
+        """
+        self.save_pred = save_pred
+        self.metrics = tuple(metrics) if metrics else self.DEFAULT_METRICS
+        self.save_cm = save_cm
+        slow = [m for m in self.metrics if m in SemSegEvaluator.DISTANCE_BASED]
+        assert not slow, (
+            "{} are distance-based: they need the prediction reconstructed as a 3D voxel "
+            "grid, not a point list, and are intractable at ~2e6 points/volume. Run them "
+            "offline from a save_pred=True dump instead.".format(list(slow))
         )
-        for i, label_name in enumerate(self.valid_class_names):
-            ap = ap_scores["classes"][label_name]["ap"]
-            ap_50 = ap_scores["classes"][label_name]["ap50%"]
-            ap_25 = ap_scores["classes"][label_name]["ap25%"]
-            logger.info(
-                "Class_{idx}-{name} Result: AP/AP50/AP25 {AP:.4f}/{AP50:.4f}/{AP25:.4f}".format(
-                    idx=i, name=label_name, AP=ap, AP50=ap_50, AP25=ap_25
-                )
+        self.num_classes = cfg.data.num_classes
+        self.bg_class = cfg.data.bg_class
+        self.rib_metrics = (
+            self.num_classes == self.N_RIB_CLASSES if rib_metrics is None else rib_metrics
+        )
+        assert not (self.rib_metrics and self.num_classes != self.N_RIB_CLASSES), (
+            "rib_metrics needs exactly {} classes, got {}".format(self.N_RIB_CLASSES, self.num_classes)
+        )
+        super().__init__(cfg, model=model, test_loader=test_loader, verbose=verbose)
+
+    def build_test_loader(self):
+        test_dataset = build_dataset(self.cfg.data.test)
+        if comm.get_world_size() > 1:
+            # pads the volume list to a multiple of world size, so a few volumes
+            # are evaluated twice; records are keyed by volume id and deduped.
+            test_sampler = torch.utils.data.distributed.DistributedSampler(
+                test_dataset, shuffle=False
             )
-        logger.info("<<<<<<<<<<<<<<<<< End InsSegTester Evaluation <<<<<<<<<<<<<<<<<")
+        else:
+            test_sampler = None
+        return torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=1,  # one whole volume per item
+            shuffle=False,
+            # each worker holds a full ~2e6-point volume, so keep this small
+            num_workers=min(2, self.cfg.num_worker_per_gpu),
+            pin_memory=False,
+            sampler=test_sampler,
+            collate_fn=self.__class__.collate_fn,
+        )
 
+    @staticmethod
+    def collate_fn(batch):
+        return batch[0]
 
-@TESTERS.register_module()
-class Ins2SemTester(SemSegTester2):
-    """(7 Oct 2025, iTom) convert instance id to rib class
-    Use `cfg.data.num_classes_semseg`, instead of `cfg.data.num_classes`, in metric calculation.
-    """
     def test(self):
-        assert self.test_loader.batch_size == 1
         logger = get_root_logger()
-        logger.info(">>>>>>>>>>>>>>>> Start Ins2SemTester Evaluation >>>>>>>>>>>>>>>>")
-
-        # tp_meter = AverageMeter()
-        # tn_meter = AverageMeter()
-        # fp_meter = AverageMeter()
-        # fn_meter = AverageMeter()
+        logger.info(">>>>>>>>>>>>>>>> Start Ribsegv2VolumeTester Evaluation >>>>>>>>>>>>>>>>")
         self.model.eval()
+        n_cls = self.num_classes
+        if self.save_pred:
+            save_path = os.path.join(self.cfg.save_path, "result")
+            make_dirs(save_path)
 
-        save_path = os.path.join(self.cfg.save_path, "result")
-        make_dirs(save_path)
         comm.synchronize()
-        record = {}
-        for idx, data_dict in enumerate(self.test_loader):
-            # print(idx)
-            data_dict = data_dict[0]  # current assume batch size is 1
-            save_dict = {}
+        records = {}  # volume id -> per-volume metrics
+        conf_mats = {}  # volume id -> [n_cls, n_cls]; keyed so duplicates dedupe
+        batch_time = AverageMeter()
+        end = time.time()
+        for i, data_dict in enumerate(self.test_loader):
+            name = data_dict.pop("name")
+            # full-resolution fields: keep them on CPU, they are ~2e6 long
+            inverse = data_dict.pop("inverse").numpy()
+            label = data_dict.pop("origin_segment").numpy()
+            voxel_index = data_dict.pop("origin_voxel_index").numpy()
+            data_dict.pop("segment", None)  # grid-level label; drop it to take the test branch
             for key in data_dict.keys():
                 if isinstance(data_dict[key], torch.Tensor):
-                    save_dict[key] = data_dict[key].numpy()
                     data_dict[key] = data_dict[key].cuda(non_blocking=True)
+
             with torch.no_grad():
-                output_dict = self.model(data_dict)
-            # pred = output_dict["seg_logits"].max(1)[1]#.cpu().numpy()
-            save_dict.update({k: v.cpu().numpy() for k, v in output_dict.items()})
+                seg_logits = self.model(data_dict)["seg_logits"]  # [n_grid, n_cls]
+            pred_grid = seg_logits.max(1)[1].cpu().numpy()
+            pred = pred_grid[inverse]  # [n_orig], back to full resolution
+            assert pred.shape == label.shape, \
+                "volume {}: pred {} vs label {}".format(name, pred.shape, label.shape)
 
-            # combine instance prediction
-            pred_ins = torch.zeros_like(output_dict["pred_masks"][0]) # [npt]
-            for i, m in enumerate(output_dict["pred_masks"]):
-                pred_ins[m > 0] = i + 1 # `+1` to avoid being 0
-            # map points back to voxel grids
-            pred_ins = pred_ins.cpu().numpy()
-            xyz = data_dict["origin_coord"].cpu().numpy().astype(int) # [npt, 3]
-            assert (xyz >= 0).all() # they are all voxel positions
-            _x, _y, _z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
-            shape = [_x.max() + 1, _y.max() + 1, _z.max() + 1]
-            pred_vol = np.zeros(shape, dtype=int)
-            pred_vol[_x, _y, _z] = pred_ins
-            # re-label: convert instance id to semantic class
-            pred_vol, _ = relabel_ribs_anatomical(pred_vol, data_dict["orientation"])
-            pred = pred_vol[_x, _y, _z] # -> [npt]
-            save_dict.update({"pred_semseg": pred})
-
-            # draw confusion matrix (based on instance & ins pred)
-            gt_ins = data_dict["instance"].cpu().numpy()
-            gt_ins -= gt_ins.min() # shift to 0-base
-            gt_nc = np.unique(gt_ins).shape[0]
-            nc = int(output_dict["pred_masks"].size(0))
-            pred_ins_ra = eval_cluster.reorder_assignment(
-                gt_ins, pred_ins - pred_ins.min(), gt_nc, nc+1)
-            cm = sklearn.metrics.confusion_matrix(gt_ins, pred_ins_ra)
-
-            # segment = data_dict.pop("segment")#.cpu().numpy()
-            label = data_dict.pop("label") # original multi-class label
-            data_name = data_dict.pop("name")
-            tp, tn, fp, fn = confusion_matrix(
-                # pred,
-                torch.from_numpy(pred).to(label.device),
-                # segment,
-                label,
-                # self.cfg.data.num_classes,
-                self.cfg.data.num_classes_semseg,
-                self.cfg.data.ignore_index,
+            records[name] = self.eval_volume(pred, label, n_grid=pred_grid.shape[0])
+            conf_mats[name] = np.bincount(
+                label.astype(np.int64) * n_cls + pred.astype(np.int64),
+                minlength=n_cls * n_cls,
+            ).reshape(n_cls, n_cls)
+            if self.save_pred:
+                np.savez_compressed(
+                    os.path.join(save_path, "{}.npz".format(name)),
+                    pred=np_smallest_dtype(pred),
+                    label=np_smallest_dtype(label),
+                    voxel_index=np_smallest_dtype(voxel_index),
+                )
+            batch_time.update(time.time() - end)
+            end = time.time()
+            logger.info(
+                "Test: [{}/{}] volume {} {} -> {} points {:.3f}s".format(
+                    i + 1, len(self.test_loader), name,
+                    pred_grid.shape[0], pred.shape[0], batch_time.val,
+                )
             )
-            tp, tn, fp, fn = tp.cpu().numpy(), tn.cpu().numpy(), fp.cpu().numpy(), fn.cpu().numpy()
-            # tp_meter.update(tp)
-            # tn_meter.update(tn)
-            # fp_meter.update(fp)
-            # fn_meter.update(fn)
-            record[data_name] = dict(
-                tp=tp, tn=tn, fp=fp, fn=fn
-            )
-            res = calc_cm_metrics(tp, tn, fp, fn,
-                self.cfg.data.num_classes_semseg, self.cfg.data.ignore_index)
-            save_dict.update(res)
-
-            np.savez_compressed(os.path.join(save_path, "Ins2Sem-{}.npz".format(data_name)), **save_dict)
-            # save confusion matrix visualisation
-            vis_confusion_matrix(cm, [str(i) for i in range(max(gt_nc, nc))], os.path.join(
-                save_path, "cm-{}.png".format(data_name)), "{}: dice {:.4f}".format(data_name, res["dice"]))
 
         logger.info("Syncing ...")
         comm.synchronize()
-        record_sync = comm.gather(record, dst=0)
+        gathered = comm.gather(dict(records=records, conf_mats=conf_mats), dst=0)
+        if not comm.is_main_process():
+            return
 
-        if comm.is_main_process():
-            record = {}
-            for _ in range(len(record_sync)):
-                r = record_sync.pop()
-                record.update(r)
-                del r
+        records, conf_mats = {}, {}
+        for g in gathered:
+            # DistributedSampler pads the volume list, so a few volumes come
+            # back twice; keying by volume id drops the duplicates
+            records.update(g["records"])
+            conf_mats.update(g["conf_mats"])
+        conf_mat = np.sum(list(conf_mats.values()), axis=0)
 
-            tp = np.sum([meters["tp"] for _, meters in record.items()], axis=0)
-            tn = np.sum([meters["tn"] for _, meters in record.items()], axis=0)
-            fp = np.sum([meters["fp"] for _, meters in record.items()], axis=0)
-            fn = np.sum([meters["fn"] for _, meters in record.items()], axis=0)
-            metrics = calc_cm_metrics(tp, tn, fp, fn,
-                self.cfg.data.num_classes_semseg, self.cfg.data.ignore_index)
-                # self.cfg.data.num_classes, self.cfg.data.ignore_index)
-            for k, v in metrics.items():
-                logger.info("{}: {}".format(k, v))
+        summary = self.reduce(records, conf_mat)
+        prefix = os.path.join(
+            self.cfg.save_path, "{}-{}".format(self.cfg.data.test.split, self.__class__.__name__)
+        )
+        with open(prefix + ".json", 'w') as f:
+            json.dump(to_jsonable({
+                "time": time.asctime(time.gmtime()),
+                "epoch": getattr(self, "ckpt_epoch", -1),
+                "n_volumes": len(records),
+                "metrics": summary,
+                "args": to_dict(self.cfg),
+            }), f, indent=1)
+        with open(prefix + "-per_volume.json", 'w') as f:
+            json.dump(to_jsonable(records), f, indent=1)
 
-            with open(os.path.join(self.cfg.save_path, "test-Ins2SemTester.json"), "w") as f:
-                json.dump(metrics, f, indent=1)
+        if self.save_cm:
+            np.save(prefix + "-confusion_matrix.npy", conf_mat)
+            row_norm = conf_mat / np.clip(conf_mat.sum(1, keepdims=True), 1, None)
+            try:
+                vis_confusion_matrix(
+                    np.round(row_norm, 2), list(self.cfg.data.names), prefix + "-confusion_matrix.png",
+                    title="Row-normalised confusion matrix ({} volumes)".format(len(records)),
+                )
+            except Exception as e:
+                logger.warning("Failed to plot the confusion matrix: {}".format(e))
 
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        for k, v in summary.items():
+            logger.info("{}: {}".format(k, v))
+        logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
 
+    def eval_volume(self, pred, label, n_grid):
+        """all metrics of a single volume, at full resolution
+        Args:
+            pred: int numpy.ndarray[n_points], point-wise predicted class id
+            label: same shape as `pred`, ground-truth class id
+            n_grid: int, how many points the model actually saw
+        Returns:
+            dict, `<metric>_cw` holds per-class values (NaN where the class is
+            absent from this volume) and the rest are volume-level scalars.
+        """
+        # a throw-away evaluator per volume: its `records[metr][c]` is a 1-element
+        # list, which keeps NaN intact. `reduce()` would turn NaN into 0.0 here.
+        evaluator = SemSegEvaluator(
+            n_classes=self.num_classes, bg_classes=[self.bg_class], select=self.metrics
+        )
+        with quiet_nan():
+            evaluator(pred=pred, y=label)
+            row = {
+                "{}_cw".format(m): [float(evaluator.records[m][c][0]) for c in range(self.num_classes)]
+                for m in evaluator.metrics
+            }
+            row["n_points"] = int(label.size)
+            row["n_grid_points"] = int(n_grid)
+            row.update(error_rate(pred, label, self.bg_class))
+            integrity = compute_prediction_integrity(pred, label)
+            row.update({k: integrity[k] for k in ("mean_integrity", "weighted_mean_integrity", "global_integrity")})
+            if self.rib_metrics:
+                row.update(error_rate_rib(pred, label, self.bg_class))
+                row.update(rib_label_acc(pred, label))
+                # left/right and class-wise breakdown of the rib-id shift
+                shift = rib_id_shift_rate(pred, label)
+                row.update({k: shift[k] for k in ("nsr_left", "nsr_right", "fsr_left", "fsr_right", "nsr_cw", "fsr_cw")})
+        return row
 
-@TESTERS.register_module()
-class SavePredVolumeTester(Ins2SemTester):
-    """just predict & save, no evaluation"""
-    def build_test_loader(self):
-        assert comm.get_world_size() == 1
-        return build_dataset(self.cfg.data.test_volume)
+    def reduce(self, records, conf_mat):
+        """average every per-volume record across volumes"""
+        n_cls = self.num_classes
+        order = sorted(records, key=int)
+        fg = [c for c in range(n_cls) if c != self.bg_class]
 
-    def test(self):
-        assert self.cfg.batch_size_test_per_gpu == 1, str(self.cfg.batch_size_test_per_gpu)
-        self.model.eval()
-        save_path = os.path.join(self.cfg.save_path, "pred_volume")
-        make_dirs(save_path)
-        for vol_dset in self.test_loader:
-            print(vol_dset.volume_id)
-            vol_loader = torch.utils.data.DataLoader(
-                vol_dset,
-                batch_size=self.cfg.batch_size_test_per_gpu,
-                shuffle=False,
-                num_workers=self.cfg.batch_size_test_per_gpu,
-                pin_memory=True,
-                sampler=None,
-                collate_fn=self.__class__.collate_fn
-            )
-            save_dict = {}
-            for idx, data_dict in enumerate(vol_loader):
-                data_dict = data_dict[0]  # current assume batch size is 1
-                for key in data_dict.keys():
-                    if key in ("coord", "origin_coord", "instance"):
-                        d = data_dict[key].numpy()
-                        if key not in save_dict:
-                            save_dict[key] = d
-                        else:
-                            save_dict[key] = np.concatenate([save_dict[key], d], axis=0)
+        # class-wise overlap metrics, via SemSegEvaluator's own aggregation path
+        evaluator = SemSegEvaluator(
+            n_classes=n_cls, bg_classes=[self.bg_class], select=self.metrics
+        )
+        for name in order:
+            evaluator.load_from_dict(records[name])
+        with quiet_nan():
+            summary = evaluator.reduce()
 
-                    if isinstance(data_dict[key], torch.Tensor):
-                        data_dict[key] = data_dict[key].cuda(non_blocking=True)
+        # `reduce()` averages over every class including background, which the
+        # background dominates. Redo the overall number over foreground only,
+        # still averaging per volume first.
+        for m in self.metrics:
+            cls_by_vol = np.asarray(
+                [[records[n]["{}_cw".format(m)][c] for n in order] for c in fg], dtype=float
+            )  # [n_fg_classes, n_volumes]
+            per_volume = nanmean(cls_by_vol, axis=0)
+            summary["{}_fg".format(m)] = nanmean(per_volume)
+            summary["{}_fg_vol".format(m)] = calc_stat(per_volume, percentages=[5, 25, 50, 75, 95], prec=4)
 
-                with torch.no_grad():
-                    output_dict = self.model(data_dict)
+        # volume-level scalars: error rates, label accuracy, integrity, sizes
+        for k, v in records[order[0]].items():
+            if k.endswith("_cw") or not isinstance(v, (int, float)):
+                continue
+            vals = np.asarray([records[n].get(k, np.nan) for n in order], dtype=float)
+            summary[k] = nanmean(vals)
+            summary[k + "_vol"] = calc_stat(vals, percentages=[5, 25, 50, 75, 95], prec=4)
 
-                for key in ["bias_pred"]:
-                    d = output_dict[key].cpu().numpy()
-                    if key not in save_dict:
-                        save_dict[key] = d
-                    else:
-                        save_dict[key] = np.concatenate([save_dict[key], d], axis=0)
+        if not self.rib_metrics:
+            return summary
 
-                print(idx, end='\r')
-
-            np.savez_compressed(os.path.join(save_path, "{}.npz".format(vol_dset.volume_id)), **save_dict)
+        # Is the residual rib-vs-rib confusion concentrated on adjacent ribs?
+        # A dominant off-by-one band means the model cannot count ribs from the
+        # top, i.e. it is missing global context rather than local shape.
+        rib = np.arange(1, n_cls)
+        fg_cm = conf_mat[1:, 1:].astype(np.float64)
+        offset = np.abs(rib[:, None] - rib[None, :])
+        cross_side = ((rib[:, None] == 12) & (rib[None, :] == 13)) | \
+                     ((rib[:, None] == 13) & (rib[None, :] == 12))
+        wrong = fg_cm.sum() - np.trace(fg_cm)
+        summary["fg_confusion"] = {
+            "n_wrong_rib_points": int(wrong),
+            "off_by_1_share": float(fg_cm[(offset == 1) & ~cross_side].sum() / max(wrong, 1.0)),
+            "off_by_2_share": float(fg_cm[(offset == 2) & ~cross_side].sum() / max(wrong, 1.0)),
+            "cross_side_share": float(fg_cm[cross_side].sum() / max(wrong, 1.0)),
+        }
+        return summary

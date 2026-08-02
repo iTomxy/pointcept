@@ -11,12 +11,17 @@ cfg_f=configs/$dset/${cfg}.py
 
 
 bash scripts/train.sh -g 2 -d $dset -c $cfg -n $exp -p /opt/conda/bin/python -r true \
-    2> error.${0%.*}.log
+    2> error.${0%.*}-train.log
 
 
-bash scripts/test.sh -g 1 -d $dset -c $cfg -n $exp -p /opt/conda/bin/python \
-    -w model_best -o test.save_pred=False \
-    2> error.${0%.*}.log
+bash scripts/test.sh -g 1 -d $dset -n $exp -p /opt/conda/bin/python \
+    -w model_best -o test.save_pred=True -o data.test.add_trainval_incomplete=False \
+    2> error.${0%.*}-test.log
+
+
+bash scripts/test.sh -g 1 -d $dset -n $exp -p /opt/conda/bin/python \
+    -w model_best -o test.save_pred=False -o data.test.add_trainval_incomplete=False -o data.test.split=train \
+    2> error.${0%.*}-test_trainset.log
 
 
 # . $HOME/mail.sh "cmd done" "[`date`] `whoami`@`hostname`:`realpath $0`, $LINENO"

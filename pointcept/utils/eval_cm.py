@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import medpy.metric.binary as mmb
 import torch
 
 
@@ -422,3 +423,232 @@ def compute_prediction_integrity(pred: np.ndarray, y: np.ndarray) -> dict:
         "weighted_mean_integrity": weighted_mean_integrity,
         "global_integrity": global_integrity,
     }
+
+
+def rib_label_acc(pred, y, recall_thres=0.7):
+    """label accuracy defined in Sec. V.A.1 in RibSegv2 (https://arxiv.org/abs/2210.09309)
+    Args:
+        pred: int numpy.ndarray, point-wise prediction
+        y: same size of pred, ground-truth point-wise label
+        recall_thres: float = 0.7, within [0, 1]
+    Returns:
+        dict with fields:
+            - label_acc: float, accuracy over all present rib classes (1-24)
+            - label_acc_first: float, accuracy for first rib pair (classes 1, 13)
+            - label_acc_inter: float, accuracy for intermediate pairs (2-11, 14-23)
+            - label_acc_last: float, accuracy for 12th rib pair (classes 12, 24)
+            - recall_cw: List[float], per-class recall, length 25; index 0 (bg) = NaN;
+                         NaN for ribs absent from y (incomplete rib cage cases)
+            - correctly_labeled_cw: List[bool|None], per-class flag; None if absent from y
+    """
+    pred = pred.flatten()
+    y = y.flatten()
+
+    num_classes = 25  # class 0 (bg) + classes 1..24 (ribs)
+    recall_cw = np.full(num_classes, np.nan)
+    correctly_labeled_cw = [None] * num_classes
+
+    for c in range(1, num_classes):
+        n_gt = int((y == c).sum())
+        if n_gt == 0:
+            continue  # rib absent from this scan (incomplete rib cage)
+        tp = int(((pred == c) & (y == c)).sum())
+        recall_cw[c] = tp / n_gt
+        # cast to a built-in bool: the numpy comparison yields np.bool_, which
+        # json.dump rejects, and this dict usually ends up in a json log
+        correctly_labeled_cw[c] = bool(recall_cw[c] > recall_thres)
+
+    def _group_acc(classes):
+        present = [c for c in classes if correctly_labeled_cw[c] is not None]
+        if len(present) == 0:
+            return math.nan
+        return float(sum(correctly_labeled_cw[c] for c in present)) / len(present)
+
+    all_ribs   = list(range(1, 25))
+    first_ribs = [1, 13]
+    inter_ribs = list(range(2, 12)) + list(range(14, 24))
+    last_ribs  = [12, 24]
+
+    return {
+        "label_acc":            _group_acc(all_ribs),
+        "label_acc_first":      _group_acc(first_ribs),
+        "label_acc_inter":      _group_acc(inter_ribs),
+        "label_acc_last":       _group_acc(last_ribs),
+        "label_acc_recall_cw":  recall_cw.tolist(),
+        "correctly_labeled_cw": correctly_labeled_cw,
+    }
+
+
+class SemSegEvaluator:
+    """numpy.ndarray based segmentation evaluation for semantic segmentation.
+
+    NOTE: Remember to reconstruct to original data structure when calculating
+    distance-based metrics like HD and ASSD, e.g. when running for pointclouds
+    converted from CT scans (voxel-grids), restore the [#points]-shape prediction
+    back to a [H, W, L] shape 3D voxel-grid shape prediction volume before
+    feeding to this class for evaluation.
+    But overlapping metrics like mIoU and precision are fine.
+    """
+
+    METRICS = {
+        "dice": mmb.dc, # = F1
+        "iou": mmb.jc,
+        "accuracy": lambda _B1, _B2: (_B1 == _B2).sum() / _B1.size,
+        "precision": mmb.precision,
+        "recall": mmb.recall, # = sensitivity, true_positive_rate
+        "specificity": mmb.specificity, # = true_negative_rate
+        "hd": mmb.hd,
+        "assd": mmb.assd,
+        "hd95": mmb.hd95,
+        "asd": mmb.asd
+    }
+    DISTANCE_BASED = ("hd", "assd", "hd95", "asd")
+
+    def __init__(self, n_classes, bg_classes=[], ignore_classes=[], select=[]):
+        """
+        Input:
+            n_classes: int, length of the softmax logit vector.
+                For semantic/instance segmentation, this is the number of all classes.
+                For part segmentation, this is the total number of all part categories from all object classes.
+            bg_classes: int or List[int], class ID of the background class/es
+                (or similar classes for all uncategorised classes).
+                Typically, it is class 0.
+            ignore_classes: int or List[int], ID of class/es to be ignored in evaluation.
+            select: List[str], name list of metrics of interest
+                Provide if you only want to evaluate on these selected metrics
+                instead of all supported (see METRICS).
+        """
+        self.n_classes = n_classes
+        if isinstance(bg_classes, int):
+            bg_classes = (bg_classes,)
+        self.bg_classes = bg_classes
+        if isinstance(ignore_classes, int):
+            ignore_classes = (ignore_classes,)
+        self.ignore_classes = ignore_classes
+
+        if len(select) == 0:
+            self.metrics = self.METRICS
+        else:
+            self.metrics = {}
+            for m in select:
+                ml = m.lower()
+                assert ml in self.METRICS, "Not supported metric: {}".format(m)
+                self.metrics[ml] = self.METRICS[ml]
+
+        self.reset()
+
+    def reset(self):
+        # records:
+        #  - records[metr][c][i] = <metr> score of i-th datum on c-th class, or
+        #  - records[metr][c] = # of NaN caused by empty pred/label
+        self.records = {}
+        for metr in self.metrics:
+            # self.records[metr] = [[]] * self.n_classes # wrong
+            self.records[metr] = [[] for _ in range(self.n_classes)]
+        for metr in self.DISTANCE_BASED:
+            if metr in self.metrics:
+                self.records[f"empty_gt_{metr}"] = [0] * self.n_classes
+                self.records[f"empty_pred_{metr}"] = [0] * self.n_classes
+
+    def __call__(self, *, pred, y, spacing=None):
+        """evaluates 1 prediction
+        Input:
+            pred: int numpy.ndarray, prediction (class ID after argmax) of one datum, not a batch
+            y: same as `pred`, label (ground-truth class ID) of this datum
+            spacing: float[] = None, len(spacing) = pred.ndim
+        """
+        for c in range(self.n_classes):
+            B_pred_c = (pred == c).astype(np.int64)
+            B_c      = (y == c).astype(np.int64)
+            pred_l0, pred_inv_l0, gt_l0, gt_inv_l0 = B_pred_c.sum(), (1 - B_pred_c).sum(), B_c.sum(), (1 - B_c).sum()
+            for metr, fn in self.metrics.items():
+                is_distance_metr = metr in self.DISTANCE_BASED
+                # if 0 == c and (self.ignore_bg or is_distance_metr):
+                if c in self.ignore_classes or (is_distance_metr and c in self.bg_classes):
+                    # always ignore bg for distance metrics
+                    a = np.nan
+                elif 0 == gt_l0 and 0 == pred_l0 and metr in ("dice", "iou", "recall", "precision", "sensitivity"):
+                    # class absent from both -> a perfect call. "sensitivity" is
+                    # not a key of METRICS ("recall" is), so before this list
+                    # included "recall"/"precision" an absent class scored dice=1
+                    # but recall=0, i.e. the metrics disagreed with each other on
+                    # every rib missing from an incomplete rib cage.
+                    a = 1
+                elif 0 == gt_inv_l0 and 0 == pred_inv_l0 and "specificity" == metr:
+                    a = 1
+                elif is_distance_metr and pred_l0 * gt_l0 == 0: # at least one party is all 0
+                    if 0 == pred_l0 and 0 == gt_l0: # both are all 0
+                        # nips23a&d, xmed-lab/GenericSSL
+                        a = 0
+                    else: # only one party is all 0
+                        a = np.nan
+                        if 0 == pred_l0:
+                            self.records[f"empty_pred_{metr}"][c] += 1
+                        else: # 0 == gt_l0
+                            self.records[f"empty_gt_{metr}"][c] += 1
+                else: # normal cases or that medpy can solve well
+                    # try:
+                    if is_distance_metr:
+                        a = fn(B_pred_c, B_c, voxelspacing=spacing)
+                    else:
+                        a = fn(B_pred_c, B_c)
+                    # except:
+                    #     a = np.nan
+
+                self.records[metr][c].append(a)
+
+    def load_from_dict(self, vw_dict):
+        """Useful when aggregating volume-wise results to an overall one.
+        Assumes the dict structure to be as follows:
+        {
+            "<METRIC>_cw": List[float]
+            "<other keys>": Any
+        }
+        Only keys of format `<METRIC>_cw` are used, while other keys are ignored.
+        """
+        for metr in vw_dict:
+            if not metr.endswith("_cw") or metr.startswith("empty_"): # only use class-wise records
+                continue
+            cw_list = vw_dict[metr]
+            assert len(cw_list) == self.n_classes
+            metr = metr[:-3] # remove "_cw"
+            if metr not in self.metrics:
+                continue
+            for c, v in enumerate(cw_list):
+                if c in self.ignore_classes or (metr in self.DISTANCE_BASED and c in self.bg_classes):
+                    # always ignore bg for distance metrics
+                    self.records[metr][c].append(np.nan)
+                else:
+                    self.records[metr][c].append(v)
+
+    def reduce(self, prec=4):
+        """calculate class-wise & overall average
+        Input:
+            prec: int, decimal precision
+        Output:
+            res: dict
+                - res[<metr>]: float, overall average
+                - res[<metr>_cw]: List[float], class-wise average of each class
+                - res[empty_pred|gt_<metr>]: int, overall #NaN caused by empty pred/label
+                - res[empty_pred|gt_<metr>_cw]: List[int], class-wise #NaN
+        """
+        res = {}
+        for metr in self.records:
+            if metr.startswith("empty_"):
+                res[metr+"_cw"] = self.records[metr]
+                res[metr] = int(np.sum(self.records[metr]))
+            else:
+                CxN = np.asarray(self.records[metr], dtype=float)
+
+                # class-wise average
+                cls_avg = np.nanmean(CxN, axis=1)  # [c]
+                cls_avg = np.nan_to_num(cls_avg, nan=0.0)  # replace NaN with 0 if all values for a class are NaN
+                res[f"{metr}_cw"] = np.round(cls_avg, prec).tolist()
+
+                # overall average
+                ins_avg = np.nanmean(CxN, axis=0)  # [n]
+                avg = np.nanmean(ins_avg)  # overall average across instances
+                avg = 0.0 if np.isnan(avg) else avg  # handle case where all values are NaN
+                res[metr] = float(np.round(avg, prec))
+
+        return res

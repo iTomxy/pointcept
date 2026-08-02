@@ -1,55 +1,22 @@
 # iTom, 2025 dec 8
-# Adapted from:
-# - ../matterport3d/semseg-pt-v3m1-0-base.py
-# - ./semseg-dgcnn.py
+# Stage-1 rib vs. non-rib segmentation with PTv3. Its saved predictions become
+# the `sieve_mask` that stage 2 (semseg-pt_v3m1_0_base.py) can restrict itself
+# to, so `data.test.split` is "all": every volume needs a prediction, not just
+# the test split.
 
-_base_ = ["../_base_/default_runtime.py"]
-enable_wandb = False # to avoid bug
-enable_amp = False # https://github.com/Pointcept/Pointcept/issues/249#issuecomment-2109206794
+_base_ = ["semseg-pt_v3m1_0_base.py"]
 
-
-# misc custom setting
-batch_size = 8  # bs: total bs in all gpus
-batch_size_test = None  # auto adapt to bs 1 for each gpu
+# Sub-sampling is inherited in spirit from the base config (grid-subsample the
+# whole rib cage, never a random scatter and never a spatial crop) -- see the
+# note there for why the old 2e-3 grid made every PTv3 encoder stage a no-op.
+# The pipelines are restated rather than inherited only because `BinarizeLabel`
+# and the rib augmentations have to be interleaved at specific points, and
+# config list values are replaced wholesale rather than merged.
 
 # model settings
 model = dict(
-    type="DefaultSegmentorV2",
     num_classes=1+1, # fg vs. bg
-    backbone_out_channels=64,
-    backbone=dict(
-        type="PT-v3m1",
-        in_channels=1, # hu
-        order=("z", "z-trans", "hilbert", "hilbert-trans"),
-        stride=(2, 2, 2, 2),
-        enc_depths=(2, 2, 2, 6, 2),
-        enc_channels=(32, 64, 128, 256, 512),
-        enc_num_head=(2, 4, 8, 16, 32),
-        enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-        dec_depths=(2, 2, 2, 2),
-        dec_channels=(64, 64, 128, 256),
-        dec_num_head=(4, 4, 8, 16),
-        dec_patch_size=(1024, 1024, 1024, 1024),
-        mlp_ratio=4,
-        qkv_bias=True,
-        qk_scale=None,
-        attn_drop=0.0,
-        proj_drop=0.0,
-        drop_path=0.3,
-        shuffle_orders=True,
-        pre_norm=True,
-        enable_rpe=False,
-        enable_flash=True,
-        upcast_attention=False,
-        upcast_softmax=False,
-        cls_mode=False,
-        pdnorm_bn=False,
-        pdnorm_ln=False,
-        pdnorm_decouple=True,
-        pdnorm_adaptive=False,
-        pdnorm_affine=True,
-        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
-    ),
+    backbone=dict(in_channels=1),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
         # dict(type="FocalLoss", loss_weight=1.0, ignore_index=-1),
@@ -58,170 +25,121 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 100
-eval_epoch = epoch
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
-scheduler = dict(
-    type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
-    pct_start=0.05,
-    anneal_strategy="cos",
-    div_factor=10.0,
-    final_div_factor=1000.0,
-)
-param_dicts = [dict(keyword="block", lr=0.0006)]
+
 
 # dataset settings
 dataset_type = "Ribsegv2Dataset"
 data_root = "data/ribsegv2"
-npoints = 15000
 hu_thres = 200
-grid_size = 2e-3 # small enough so that the point cloud resolution won't change much
+hu_window = (200.0, 1500.0)
 fg_classes = tuple(range(1, 24+1))
-preproc = True # use preprocessed data (crop to foreground region) or not
-if preproc:
-    # data/ribsegv2/complete-radius-preproc.json
-    global_radius = 254.79
-else:
-    # data/ribsegv2/complete-radius.json
-    global_radius = 259.16 # in mm, 99.5% percentage of complete volume in physical coordinate
+# `ReadNpz` always loads data/ribsegv2/pt_preproc, which is built from the FULL
+# scans, so the radius has to be the one measured on those. This used to read
+# 254.79 (the foreground-cropped figure) while loading the uncropped cache,
+# which normalised the same points differently from every other config.
+global_radius = 259.16 # data/ribsegv2/complete-radius.json
+grid_size_mm = 3.0
+grid_size = grid_size_mm / global_radius
+max_points = 250000
+
+
+def build_pipeline(mode):
+    """
+    mode: str, one of "train" (augmented), "val", or "test" (volume-wise)
+    """
+    assert mode in ("train", "val", "test")
+    pipeline = [
+        dict(type="ReadNpz", rename_keys={"label": "segment"}),
+        dict(type="ToPhysicalCoord"),
+        # `intensity` is an integer on disk purely to keep the cache small
+        dict(type="TypeCast", key_type={"coord": "f4", "intensity": "f4"}),
+        dict(type="WindowIntensity", window=hu_window, src_key="intensity", dest_key="strength"),
+    ]
+    if mode == "train":
+        # these pick whole ribs out by class id, so they must run while the
+        # labels still distinguish rib1..rib24 -- after BinarizeLabel there is
+        # only one foreground class left, `n_p < 2`, and both become no-ops
+        pipeline.append(dict(type="RandomApply", cfgs=[
+            dict(type="RandomDropRibPoint", keys=("coord", "strength"), max_drop_depth=7, begin_from='', allow_single=True, p=0.5),
+            dict(type="RandomTruncateRibPoint", keys=("coord", "strength"), max_drop_depth=7, begin_from='', pos='', p=0.5, is_axis=2),
+        ]))
+    pipeline += [
+        dict(type="BinarizeLabel", coi=fg_classes),
+        dict(type="ExpandDims", key_axes=[("strength", 1)]),
+        dict(type="NormalizeCoord", radius=global_radius),
+        dict(type="CenterShift", apply_z=True),
+    ]
+    if mode == "train":
+        pipeline += [
+            dict(type="RandomScale", scale=[0.8, 1.25]),
+            dict(type="RandomShift", shift=[[-0.02, 0.02], [-0.02, 0.02], [-0.02, 0.02]]),
+        ]
+    if mode == "test":
+        # keep the full-resolution label & voxel index outside `index_valid_keys`
+        # so GridSample leaves them at full length for `inverse` to index into
+        pipeline.append(
+            dict(type="Copy", keys_dict={"segment": "origin_segment", "voxel_index": "origin_voxel_index"})
+        )
+    pipeline.append(dict(
+        type="GridSample",
+        grid_size=grid_size,
+        hash_type="fnv",
+        mode="train",
+        return_grid_coord=True,
+        return_inverse=(mode == "test"),
+    ))
+    if mode != "test":
+        pipeline.append(dict(type="LimitPoint", max_points=max_points))
+    pipeline += [
+        dict(type="CenterShift", apply_z=False),
+        dict(type="ToTensor"),
+        dict(
+            type="Collect",
+            keys=("coord", "grid_coord", "segment", "inverse", "origin_segment", "origin_voxel_index")
+                 if mode == "test" else ("coord", "grid_coord", "segment"),
+            feat_keys=("strength",),
+        ),
+    ]
+    return pipeline
+
 
 data = dict(
+    _delete_=True,
     num_classes=1+1,
     bg_class=0,
     ignore_index=-1,
-    names=(
-        "background",
-        "rib",
-    ),
+    names=("background", "rib"),
     train=dict(
         type=dataset_type,
         split="train",
         data_root=data_root,
         test_mode=False,
-        transform=[
-            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
-            dict(type="BinarizeLabel", coi=fg_classes),
-            dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"), # won't affect `intensity`
-            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")),# dilate_connect=3), # so here `intensity` is still usable
-            dict(type="ToPhysicalCoord"),
-            # dict(type='CTIntensityVariation',
-            #     intensity_shift_range=(-30, 30),  # ±30 HU shift
-            #     intensity_scale_range=(0.98, 1.02),  # ±2% scaling
-            #     gamma_range=(0.95, 1.05),  # subtle gamma correction
-            #     p=0.8
-            # ),
-            # dict(type='CTDensityNoise',
-            #     noise_std=8,  # 8 HU standard deviation
-            #     p=0.5
-            # ),
-            dict(type="RandomApply", cfgs=[ # after ToPhysicalCoord
-                dict(type="RandomDropRibPoint", keys=("coord", "strength"), max_drop_depth=7, begin_from='', allow_single=True, p=0.5),
-                dict(type="RandomTruncateRibPoint", keys=("coord", "strength"), max_drop_depth=7, begin_from='', pos='', p=0.5, is_axis=2),
-            ]),
-            dict(type="ExpandDims", key_axes=[("strength", 1)]),
-            dict(type="NormalizeCoord", radius=global_radius), # before SamplePoint
-            dict(type="CenterShift", apply_z=True),
-            dict(type="RandomScale", scale=[0.8, 1.25]),
-            dict(type="RandomShift",  shift=[[-0.02, 0.02], [-0.02, 0.02], [-0.02, 0.02]]),
-            dict(
-                type="GridSample",
-                grid_size=grid_size,
-                hash_type="fnv",
-                mode="train",
-                return_grid_coord=True,
-            ),
-            dict(type="SamplePoint", npoints=npoints, keys=["coord", "grid_coord", "segment", "strength"]), # after GridSample
-            dict(type="CenterShift", apply_z=False),
-            dict(type="ToTensor"),
-            dict(
-                type="Collect",
-                keys=("coord", "grid_coord", "segment"),
-                feat_keys=("strength",),
-            ),
-        ],
+        transform=build_pipeline("train"),
     ),
     val=dict(
         type=dataset_type,
         split="val",
         data_root=data_root,
         test_mode=False,
-        transform=[
-            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
-            dict(type="BinarizeLabel", coi=fg_classes),
-            dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"), # won't affect `intensity`
-            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")),# dilate_connect=3), # so here `intensity` is still usable
-            dict(type="ToPhysicalCoord"),
-            dict(type="ExpandDims", key_axes=[("strength", 1)]),
-            dict(type="NormalizeCoord", radius=global_radius), # before SamplePoint
-            dict(type="CenterShift", apply_z=True),
-            dict(
-                type="GridSample",
-                grid_size=grid_size,
-                hash_type="fnv",
-                mode="train",
-                return_grid_coord=True,
-            ),
-            dict(type="SamplePoint", npoints=npoints, keys=["coord", "grid_coord", "segment", "strength"]),
-            dict(type="CenterShift", apply_z=False),
-            dict(type="ToTensor"),
-            # dict(type="Transpose", keys=["coord", "strength"], axes=[1, 0]), # [npt, 3] -> [3, npt]
-            dict(
-                type="Collect",
-                keys=("coord", "grid_coord", "segment"),
-                feat_keys=("strength",),
-            ),
-        ],
+        transform=build_pipeline("val"),
     ),
     test=dict(
-        type="Ribsegv2VolumeLoader",
-        split="all", # for binary segmentation, test & save all volume prediction
-        dataset_cls="Ribsegv2Volume",
-        npoints=npoints,
+        type="Ribsegv2VolumeDataset",
+        # every volume, so stage 2 has a sieve mask for train/val/test alike
+        split="all",
         data_root=data_root,
-        drop_last_thres=npoints // 4,
-        preproc_transform=[ # data reading & preprocessing
-            dict(type="ReadNifti", keys=(("intensity", "f4"), ("segment", "i4")), meta_key="intensity"),
-            dict(type="BinarizeLabel", coi=fg_classes),
-            dict(type="Reorient", keys=("intensity", "segment"), new_ornt="LPS"), # keep this at test cuz it affects voxel_index
-            dict(type="NormalizeIntensity", clip_percentile=(0.5, 99.5), dest_key="strength"),
-            dict(type="CT2PointCloud", hu_thres=hu_thres, keys=("segment", "strength")),# dilate_connect=3),
-            dict(type="ToPhysicalCoord"),
-            dict(type="ExpandDims", key_axes=[("strength", 1)]),
-            dict(type="NormalizeCoord", radius=global_radius),
-        ],
-        transform=[
-            # at test, SamplePoint before GridSample cuz specified sample_idx & batch_size=1
-            dict(type="SamplePoint", npoints=npoints, keys=["coord", "segment", "strength", "voxel_index"]),
-            dict(type="CenterShift", apply_z=True),
-            dict(
-                type="GridSample",
-                grid_size=grid_size,
-                hash_type="fnv",
-                mode="train",
-                return_grid_coord=True,
-            ),
-            dict(type="CenterShift", apply_z=False),
-            dict(type="ToTensor"),
-            # dict(type="Transpose", keys=["coord", "strength"], axes=[1, 0]), # [npt, 3] -> [3, npt]
-            dict(
-                type="Collect",
-                keys=("coord", "grid_coord", "segment", "voxel_index"),
-                feat_keys=("strength",),
-            ),
-        ],
+        transform=build_pipeline("test"),
     ),
 )
 
 
-test = dict(type="SemSegVolumeTester1Gpu", save_pred=True)
+test = dict(
+    save_pred=True, # stage 2 sieves on this; see preproc.recon_3d_bin_pred
+    # the rib-index metrics need the 25-class set, and are auto-disabled here
+    metrics=("dice", "iou", "precision", "recall", "specificity", "accuracy"),
+    save_cm=False,
+)
 
-hooks = [
-    dict(type="CheckpointLoader"),
-    dict(type="ModelHook"),
-    dict(type="IterationTimer", warmup_iter=2),
-    dict(type="InformationWriter"),
-    dict(type="SemSegEvaluator"),
-    dict(type="CheckpointSaver", save_freq=None),
-    # dict(type="PreciseEvaluator", test_last=False),
-]
+# keep the helper out of the parsed config dict
+del build_pipeline
