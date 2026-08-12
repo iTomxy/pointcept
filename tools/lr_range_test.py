@@ -52,7 +52,9 @@ def parse_args(argv=None):
     p.add_argument("--num-workers", type=int, default=6)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--safety", type=float, default=3.0,
-                   help="max_lr = turn-up knee / safety")
+                   help="max_lr <= turn-up knee / safety")
+    p.add_argument("--min-loss-frac", type=float, default=0.5,
+                   help="max_lr <= this fraction of the lr at minimum loss")
     p.add_argument("--from-json", default="",
                    help="re-derive the suggestion from a saved curve instead of sweeping again")
     p.add_argument("--out", default="")
@@ -60,7 +62,7 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def suggest(records, safety=3.0, turn_up=0.05):
+def suggest(records, safety=3.0, turn_up=0.05, min_loss_frac=0.5):
     """derive a one-cycle max_lr from the smoothed curve
 
     Anchored on the turn-up knee -- the first learning rate past the minimum
@@ -87,13 +89,22 @@ def suggest(records, safety=3.0, turn_up=0.05):
     i_steep_rel = lo + int(np.argmin(np.gradient(np.log(ema), np.log10(lr))[lo:hi]))
     after = np.nonzero(ema[i_min:] > (1.0 + turn_up) * ema[i_min])[0]
     knee = float(lr[i_min + after[0]]) if after.size else float(lr[-1])
+    # Cap below the loss minimum as well as below the knee. knee/safety alone
+    # lands at a fraction of the optimum that depends on how SHARP the turn-up
+    # is, not on where training is stable: a curve that rolls off gently puts
+    # the knee far above its minimum, and knee/3 then peaks one-cycle right on
+    # that minimum -- fine for the ~100 steps this sweep runs, too hot over a
+    # full schedule. Measured across three configs, knee/safety alone gave
+    # max_lr at 0.41x, 0.53x and 0.95x of each curve's own minimum; the extra
+    # cap pins every config to <= 0.5x, so arms stay comparable.
     return dict(
         lr_steepest=float(lr[i_steep]),
         lr_steepest_rel=float(lr[i_steep_rel]),
         lr_min_loss=float(lr[i_min]),
         lr_knee=knee,
         safety=safety,
-        max_lr=knee / safety,
+        min_loss_frac=min_loss_frac,
+        max_lr=min(knee / safety, float(lr[i_min]) * min_loss_frac),
     )
 
 
@@ -101,7 +112,7 @@ def main(argv=None):
     args = parse_args(argv)
     if args.from_json:
         saved = json.load(open(args.from_json))
-        out = dict(saved, **suggest(saved["curve"], args.safety))
+        out = dict(saved, **suggest(saved["curve"], args.safety, min_loss_frac=args.min_loss_frac))
         for k in ("lr_steepest", "lr_steepest_rel", "lr_min_loss", "lr_knee", "max_lr"):
             print("%-16s: %s" % (k, "n/a" if out[k] is None else "%.3e" % out[k]))
         json.dump(out, open(args.out or args.from_json, "w"), indent=1)
@@ -162,7 +173,7 @@ def main(argv=None):
             break
 
     out = dict(config=args.config, batch_size=micro * accum, micro_batch_size=micro,
-               accum=accum, lr_ratios=ratios, curve=records, **suggest(records, args.safety))
+               accum=accum, lr_ratios=ratios, curve=records, **suggest(records, args.safety, min_loss_frac=args.min_loss_frac))
     print("\n--- LR range test ---")
     for k in ("lr_steepest", "lr_steepest_rel", "lr_min_loss", "lr_knee", "max_lr"):
         print("%-16s: %s" % (k, "n/a" if out[k] is None else "%.3e" % out[k]))

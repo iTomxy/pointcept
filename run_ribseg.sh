@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-# trap '. $HOME/mail.sh "cmd error" "[`date`] `whoami`@`hostname`:`realpath $BASH_SOURCE[0]`, line $LINENO"' ERR TERM HUP # INT
+trap '. $HOME/mail.sh "cmd error" "[`date`] `whoami`@`hostname`:`realpath ${BASH_SOURCE[0]}`, line $LINENO"' ERR TERM HUP # INT
 # . $HOME/ld_lib_path.sh
 # export CUDA_HOME=/usr/local/cuda-11.8
 
@@ -62,4 +62,4 @@ bash scripts/test.sh -g 1 -d $dset -n $exp -p $py \
     2> error.${0%.*}-test_trainset.log
 
 
-# . $HOME/mail.sh "cmd done" "[`date`] `whoami`@`hostname`:`realpath $BASH_SOURCE[0]`, line $LINENO"
+. $HOME/mail.sh "cmd done" "[`date`] `whoami`@`hostname`:`realpath ${BASH_SOURCE[0]}`, line $LINENO"

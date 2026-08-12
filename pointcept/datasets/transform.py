@@ -595,23 +595,29 @@ class CT2PointCloud:
 class CTDensityNoise(object):
     def __init__(self,
                  noise_std=10,  # Standard deviation in HU units
-                 p=0.5):
+                 p=0.5,
+                 key="strength"):
         """
         Add Gaussian noise to CT intensity values (simulates scanner noise).
 
         Args:
             noise_std: Standard deviation of Gaussian noise in HU units
             p: Probability of applying the transform
+            key: str = "strength", field to perturb. `noise_std` is in HU, so
+                point this at the RAW HU field and run it BEFORE the feature is
+                derived -- applying an HU-scale noise to an already-normalised
+                [0, 1] feature is meaningless.
         """
         self.noise_std = noise_std
         self.p = p
+        self.key = key
 
     def __call__(self, data_dict):
-        if "strength" in data_dict.keys() and np.random.rand() < self.p:
+        if self.key in data_dict.keys() and np.random.rand() < self.p:
             noise = np.random.normal(
-                0, self.noise_std, data_dict["strength"].shape
-            ).astype(data_dict["strength"].dtype)
-            data_dict["strength"] += noise
+                0, self.noise_std, data_dict[self.key].shape
+            ).astype(data_dict[self.key].dtype)
+            data_dict[self.key] += noise
         return data_dict
 
 
@@ -621,7 +627,8 @@ class CTIntensityVariation(object):
                  intensity_shift_range=(-50, 50),  # HU units shift
                  intensity_scale_range=(0.95, 1.05),  # multiplicative scaling
                  gamma_range=(0.9, 1.1),  # gamma correction
-                 p=0.8):
+                 p=0.8,
+                 key="strength"):
         """
         CT Intensity/Density variation for point clouds derived from CT scans.
 
@@ -630,15 +637,20 @@ class CTIntensityVariation(object):
             intensity_scale_range: Multiplicative scaling (simulates different scanner gain)
             gamma_range: Gamma correction range (simulates different reconstruction kernels)
             p: Probability of applying the transform
+            key: str = "strength", field to perturb. `intensity_shift_range` is
+                in HU, so point this at the RAW HU field and run it BEFORE the
+                feature is derived; a +-50 HU shift applied to an already
+                windowed [0, 1] feature would swamp it entirely.
         """
         self.intensity_shift_range = intensity_shift_range
         self.intensity_scale_range = intensity_scale_range
         self.gamma_range = gamma_range
         self.p = p
+        self.key = key
 
     def __call__(self, data_dict):
-        if "strength" in data_dict.keys() and np.random.rand() < self.p:
-            intensity = data_dict["strength"].copy()
+        if self.key in data_dict.keys() and np.random.rand() < self.p:
+            intensity = data_dict[self.key].copy()
 
             # Apply additive shift (simulates scanner calibration differences)
             if self.intensity_shift_range is not None:
@@ -666,7 +678,7 @@ class CTIntensityVariation(object):
                     intensity_norm = np.power(intensity_norm, gamma)
                     intensity = intensity_norm * (intensity_max - intensity_min) + intensity_min
 
-            data_dict["strength"] = intensity
+            data_dict[self.key] = intensity
 
         return data_dict
 
@@ -2317,6 +2329,29 @@ class TruncateRibPoint:
             for k in self.keys:
                 data_dict[k] = data_dict[k][mask]
 
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class SelectAxis:
+    """take a subset of columns from an [N, C] field into a new key
+
+    Mainly to feed position into the feature vector: PointNeXt appends height
+    alone, so `axes=(2,)` off `coord`, while full xyz is just a `Copy`.
+    """
+    def __init__(self, key, dest_key, axes=(2,)):
+        """
+        key: str, source field, [N, C]
+        dest_key: str, where to put the selected columns, [N, len(axes)]
+        axes: Tuple[int] = (2,), which columns to keep
+        """
+        self.key = key
+        self.dest_key = dest_key
+        self.axes = list(axes)
+
+    def __call__(self, data_dict):
+        if self.key in data_dict:
+            data_dict[self.dest_key] = data_dict[self.key][:, self.axes].copy()
         return data_dict
 
 

@@ -1493,8 +1493,17 @@ class Ribsegv2VolumeTester(TesterBase):
                 "metrics": summary,
                 "args": to_dict(self.cfg),
             }), f, indent=1)
-        with open(prefix + "-per_volume.json", 'w') as f:
-            json.dump(to_jsonable(records), f, indent=1)
+        # with open(prefix + "-per_volume.json", 'w') as f:
+        #     json.dump(to_jsonable(records), f, indent=1)
+
+        # write per-volume jsonl log with logger
+        # per-line format: {"vid": <volume_id>, "metrics": {**<other_metric_fields>}}
+        pv_logger = get_logger("per_volume", log_file=prefix+"-per_volume.jsonl", fmt="%(message)s") # per-volume logger, jsonl output
+        pv_logger.info(json.dumps({"time": time.asctime(time.gmtime())}))
+        for name in sorted(records, key=int):
+            # one self-contained object per line: streamable, and appendable
+            # without having to re-read what is already there
+            pv_logger.info(json.dumps(to_jsonable({"vid": int(name), "metrics": records[name]})))
 
         if self.save_cm:
             np.save(prefix + "-confusion_matrix.npy", conf_mat)
