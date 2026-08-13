@@ -25,3 +25,4 @@ from .dataloader import MultiDatasetDataloader
 
 # bone
 from .ribsegv2 import *
+from .cbai_hip import *

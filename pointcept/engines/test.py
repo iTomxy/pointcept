@@ -28,7 +28,7 @@ from pointcept.utils.misc import (
     intersection_and_union_gpu,
     make_dirs,
     vis_confusion_matrix,
-    to_dict, calc_stat, nanmean, quiet_nan, to_jsonable, np_smallest_dtype,
+    to_dict, calc_stat, nanmean, quiet_nan, to_jsonable, np_smallest_dtype, natural_sort_key,
 )
 from pointcept.utils.eval_cm import *
 
@@ -1500,10 +1500,10 @@ class Ribsegv2VolumeTester(TesterBase):
         # per-line format: {"vid": <volume_id>, "metrics": {**<other_metric_fields>}}
         pv_logger = get_logger("per_volume", log_file=prefix+"-per_volume.jsonl", fmt="%(message)s") # per-volume logger, jsonl output
         pv_logger.info(json.dumps({"time": time.asctime(time.gmtime())}))
-        for name in sorted(records, key=int):
+        for name in sorted(records, key=natural_sort_key):
             # one self-contained object per line: streamable, and appendable
             # without having to re-read what is already there
-            pv_logger.info(json.dumps(to_jsonable({"vid": int(name), "metrics": records[name]})))
+            pv_logger.info(json.dumps(to_jsonable({"vid": name, "metrics": records[name]})))
 
         if self.save_cm:
             np.save(prefix + "-confusion_matrix.npy", conf_mat)
@@ -1557,7 +1557,7 @@ class Ribsegv2VolumeTester(TesterBase):
     def reduce(self, records, conf_mat):
         """average every per-volume record across volumes"""
         n_cls = self.num_classes
-        order = sorted(records, key=int)
+        order = sorted(records, key=natural_sort_key)
         fg = [c for c in range(n_cls) if c != self.bg_class]
 
         # class-wise overlap metrics, via SemSegEvaluator's own aggregation path

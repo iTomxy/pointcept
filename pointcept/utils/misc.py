@@ -5,7 +5,7 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
-import os, math
+import os, math, re
 import contextlib
 import warnings
 from collections import abc
@@ -406,3 +406,13 @@ def to_dict(ed):
         else:
             d[k] = v
     return d
+
+
+def natural_sort_key(s, num_pattern=re.compile('([0-9]+)'), lower=False):
+    """https://stackoverflow.com/questions/4836710/is-there-a-built-in-function-for-string-natural-sort"""
+    if lower:
+        return [int(text) if text.isdigit() else text.lower()
+                for text in num_pattern.split(s)]
+    else:
+        return [int(text) if text.isdigit() else text#.lower()
+                for text in num_pattern.split(s)]
