@@ -1,4 +1,4 @@
-import math
+import math, warnings
 import numpy as np
 import medpy.metric.binary as mmb
 import torch
@@ -519,13 +519,20 @@ class SemSegEvaluator:
                 instead of all supported (see METRICS).
         """
         self.n_classes = n_classes
+        if bg_classes is None:
+            bg_classes = []
         if isinstance(bg_classes, int):
             bg_classes = (bg_classes,)
         self.bg_classes = bg_classes
+
+        if ignore_classes is None:
+            ignore_classes = []
         if isinstance(ignore_classes, int):
             ignore_classes = (ignore_classes,)
         self.ignore_classes = ignore_classes
 
+        if select is None:
+            select = []
         if len(select) == 0:
             self.metrics = self.METRICS
         else:
@@ -567,13 +574,19 @@ class SemSegEvaluator:
                 if c in self.ignore_classes or (is_distance_metr and c in self.bg_classes):
                     # always ignore bg for distance metrics
                     a = np.nan
-                elif 0 == gt_l0 and 0 == pred_l0 and metr in ("dice", "iou", "recall", "precision", "sensitivity"):
-                    # class absent from both -> a perfect call. "sensitivity" is
-                    # not a key of METRICS ("recall" is), so before this list
-                    # included "recall"/"precision" an absent class scored dice=1
-                    # but recall=0, i.e. the metrics disagreed with each other on
-                    # every rib missing from an incomplete rib cage.
-                    a = 1
+                # elif 0 == gt_l0 and 0 == pred_l0 and metr in ("dice", "iou", "recall", "precision", "sensitivity"):
+                #     a = 1
+                elif 0 == gt_l0 and 0 == pred_l0 and not is_distance_metr:
+                    # Ignore for dice, IoU, recall/sensitivity, precision, specificity and accuracy in this case.
+                    # NOTE specificity and accuracy are defined in this cased (=1) but still ignored
+                    # so that their averaging protocol/class set is consistent with other metrics.
+                    a = np.nan
+                elif 0 == gt_l0 and metr in ("recall", "sensitivity"):
+                    a = np.nan
+                    self.records["empty_gt_recall"][c] += 1
+                elif 0 == pred_l0 and "precision" == metr:
+                    a = np.nan
+                    self.records["empty_pred_precision"][c] += 1
                 elif 0 == gt_inv_l0 and 0 == pred_inv_l0 and "specificity" == metr:
                     a = 1
                 elif is_distance_metr and pred_l0 * gt_l0 == 0: # at least one party is all 0
@@ -619,7 +632,7 @@ class SemSegEvaluator:
                     # always ignore bg for distance metrics
                     self.records[metr][c].append(np.nan)
                 else:
-                    self.records[metr][c].append(v)
+                    self.records[metr][c].append(np.nan if v is None else float(v))
 
     def reduce(self, prec=4):
         """calculate class-wise & overall average
@@ -640,15 +653,17 @@ class SemSegEvaluator:
             else:
                 CxN = np.asarray(self.records[metr], dtype=float)
 
-                # class-wise average
-                cls_avg = np.nanmean(CxN, axis=1)  # [c]
-                cls_avg = np.nan_to_num(cls_avg, nan=0.0)  # replace NaN with 0 if all values for a class are NaN
-                res[f"{metr}_cw"] = np.round(cls_avg, prec).tolist()
+                with warnings.catch_warnings():
+                    # An all-NaN class or datum is the expected "not evaluated"
+                    # case here, so the empty-slice warning is not informative.
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    # class-wise average
+                    cls_avg = np.nanmean(CxN, axis=1)  # [c]
+                    # overall average
+                    ins_avg = np.nanmean(CxN, axis=0)  # [n]
+                    avg = np.nanmean(ins_avg)  # overall average across instances
 
-                # overall average
-                ins_avg = np.nanmean(CxN, axis=0)  # [n]
-                avg = np.nanmean(ins_avg)  # overall average across instances
-                avg = 0.0 if np.isnan(avg) else avg  # handle case where all values are NaN
+                res[f"{metr}_cw"] = np.round(cls_avg, prec).tolist()
                 res[metr] = float(np.round(avg, prec))
 
         return res
