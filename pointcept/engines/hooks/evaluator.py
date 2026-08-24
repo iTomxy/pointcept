@@ -109,8 +109,44 @@ class ClsEvaluator(HookBase):
 
 @HOOKS.register_module()
 class SemSegEvaluator(HookBase):
-    def __init__(self, write_cls_iou=False):
+    def __init__(self, write_cls_iou=False, select_metric="miou", beta=2.0):
+        """
+        Args:
+            write_cls_iou: bool = False, also write per-class IoU to TensorBoard/wandb.
+            select_metric: str = "miou", which metric `CheckpointSaver` uses to
+                pick the best checkpoint: "miou" (default, byte-for-byte the
+                previous behaviour) or "fbeta".
+
+                Why "fbeta" exists: in the 2-stage rib pipeline, stage 2 only
+                ever sees the foreground voxels stage 1 kept. A rib voxel
+                stage 1 drops as background is gone for good, while a voxel
+                it wrongly keeps as foreground is still correctable
+                downstream. mIoU weighs those two mistakes equally, which is
+                right for a one-stage model but wrong for a stage-1 gate.
+                Plain recall is the wrong fix -- it is maximised by calling
+                every voxel foreground. F-beta with beta=2 weighs recall 4x
+                over precision but still penalises over-prediction, so a
+                degenerate all-foreground model cannot win against a real one.
+
+                Beware the scale, though: the F2 of an all-foreground
+                predictor is 5p / (4p + 1) in the foreground fraction p, so it
+                is NOT a fixed floor. On RibSegv2 (p ~ 0.13-0.39 per volume,
+                mean 0.216 over val) that degenerate model scores F2 0.43-0.76,
+                i.e. ABOVE the 0.50 of a precision/recall-balanced one. What
+                keeps the criterion sound is the gap to a genuinely good gate:
+                precision 0.90 / recall 0.95 scores 0.94. So F2 ranks useful
+                models correctly, but its absolute value is not comparable
+                across datasets with different foreground ratios.
+            beta: float = 2.0, the beta in F-beta. Only affects the value used
+                for selection when select_metric="fbeta"; F-beta is always
+                computed and logged regardless of select_metric.
+        """
+        assert select_metric in ("miou", "fbeta"), (
+            "Unknown select_metric: {}".format(select_metric)
+        )
         self.write_cls_iou = write_cls_iou
+        self.select_metric = select_metric
+        self.beta = beta
 
     def before_train(self):
         if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
@@ -186,9 +222,34 @@ class SemSegEvaluator(HookBase):
         m_iou = np.mean(iou_class)
         m_acc = np.mean(acc_class)
         all_acc = sum(intersection) / (sum(target) + 1e-10)
+        # (24 Aug 2026, iTom) F-beta, always computed so every run reports it
+        # regardless of what the checkpoint is selected on. The per-class counts
+        # above already hold everything needed: TP = intersection,
+        # FN = target - intersection, FP = union - target.
+        beta_sq = self.beta**2
+        fbeta_class = (1 + beta_sq) * intersection / (
+            (1 + beta_sq) * intersection
+            + beta_sq * (target - intersection)
+            + (union - target)
+            + 1e-10
+        )
+        bg_class = self.trainer.cfg.data.get("bg_class", None)
+        assert not (self.select_metric == "fbeta" and bg_class is None), (
+            "select_metric='fbeta' needs data.bg_class to know which classes to "
+            "average over; this config does not define it."
+        )
+        # A background class is typically ~95% of the points and trivially
+        # scored, so including it would swamp the number being selected on.
+        # A config without a declared background has nothing to exclude.
+        fg_classes = [
+            c for c in range(self.trainer.cfg.data.num_classes) if c != bg_class
+        ]
+        m_fbeta = np.mean(fbeta_class[fg_classes])
+        fbeta_name = "F{:g}_fg".format(self.beta) if bg_class is not None \
+            else "F{:g}".format(self.beta)
         self.trainer.logger.info(
-            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
-                m_iou, m_acc, all_acc
+            "Val result: mIoU/mAcc/allAcc/{fbeta_name} {:.4f}/{:.4f}/{:.4f}/{:.4f}.".format(
+                m_iou, m_acc, all_acc, m_fbeta, fbeta_name=fbeta_name
             )
         )
         for i in range(self.trainer.cfg.data.num_classes):
@@ -206,6 +267,9 @@ class SemSegEvaluator(HookBase):
             self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
             self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
             self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            self.trainer.writer.add_scalar(
+                "val/{}".format(fbeta_name), m_fbeta, current_epoch
+            )
             if self.trainer.cfg.enable_wandb:
                 wandb.log(
                     {
@@ -214,6 +278,7 @@ class SemSegEvaluator(HookBase):
                         "val/mIoU": m_iou,
                         "val/mAcc": m_acc,
                         "val/allAcc": all_acc,
+                        "val/{}".format(fbeta_name): m_fbeta,
                     },
                     step=wandb.run.step,
                 )
@@ -234,17 +299,26 @@ class SemSegEvaluator(HookBase):
                             step=wandb.run.step,
                         )
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-        self.trainer.comm_info["current_metric_value"] = m_iou  # save for saver
-        self.trainer.comm_info["current_metric_name"] = "mIoU"  # save for saver
+        if self.select_metric == "fbeta":
+            self.trainer.comm_info["current_metric_value"] = m_fbeta  # save for saver
+            self.trainer.comm_info["current_metric_name"] = fbeta_name  # save for saver
+        else:
+            self.trainer.comm_info["current_metric_value"] = m_iou  # save for saver
+            self.trainer.comm_info["current_metric_name"] = "mIoU"  # save for saver
 
         # (21 Sept 2025, iTom) log to json file
         if comm.is_main_process():
-            log = {"epoch": current_epoch, "loss": loss_avg, "iou": m_iou, "acc_macro": m_acc, "acc_micro": all_acc}
+            log = {"epoch": current_epoch, "loss": loss_avg, "iou": m_iou, "acc_macro": m_acc, "acc_micro": all_acc,
+                   "fbeta": m_fbeta, "beta": self.beta}
             self.json_logger.info(json.dumps(log))
 
     def after_train(self):
+        # the selection metric is configurable, so name the one actually used
         self.trainer.logger.info(
-            "Best {}: {:.4f}".format("mIoU", self.trainer.best_metric_value)
+            "Best {}: {:.4f}".format(
+                "mIoU" if self.select_metric == "miou" else "F{:g}_fg".format(self.beta),
+                self.trainer.best_metric_value,
+            )
         )
 
 

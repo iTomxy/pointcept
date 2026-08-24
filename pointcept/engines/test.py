@@ -29,6 +29,7 @@ from pointcept.utils.misc import (
     make_dirs,
     vis_confusion_matrix,
     to_dict, calc_stat, nanmean, quiet_nan, to_jsonable, np_smallest_dtype, natural_sort_key,
+    staging_dir, publish_dir,
 )
 from pointcept.utils.eval_cm import *
 
@@ -1355,7 +1356,7 @@ class Ribsegv2VolumeTester(TesterBase):
     drop out of that volume's average rather than counting as zero.
     """
 
-    DEFAULT_METRICS = ("dice", "iou", "precision", "recall", "specificity", "accuracy")
+    DEFAULT_METRICS = RIBSEG_DEFAULT_METRICS  # defined in pointcept.utils.eval_cm
     N_RIB_CLASSES = 1 + 24 # background + rib1..rib24, what the rib-specific metrics assume
 
     def __init__(self, cfg, save_pred=False, metrics=None, save_cm=True, rib_metrics=None,
@@ -1420,7 +1421,14 @@ class Ribsegv2VolumeTester(TesterBase):
         self.model.eval()
         n_cls = self.num_classes
         if self.save_pred:
-            save_path = os.path.join(self.cfg.save_path, "result")
+            # Staged, then published once every rank has finished: `result/`
+            # then appears only on a complete run, so the pipeline driver can
+            # read its existence as completeness rather than counting dumps and
+            # guessing what the total should have been. Every rank writes into
+            # the same staging directory; only the main process renames it,
+            # after the synchronize + gather below.
+            pred_path = os.path.join(self.cfg.save_path, "result")
+            save_path = staging_dir(pred_path)
             make_dirs(save_path)
 
         comm.synchronize()
@@ -1516,94 +1524,24 @@ class Ribsegv2VolumeTester(TesterBase):
             except Exception as e:
                 logger.warning("Failed to plot the confusion matrix: {}".format(e))
 
+        if self.save_pred:
+            # Safe here: everything above is main-process-only, past the
+            # synchronize + gather, so no rank is still writing.
+            publish_dir(save_path, pred_path)
+            logger.info("Predictions written to {}".format(pred_path))
+
         for k, v in summary.items():
             logger.info("{}: {}".format(k, v))
         logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
 
     def eval_volume(self, pred, label, n_grid):
-        """all metrics of a single volume, at full resolution
-        Args:
-            pred: int numpy.ndarray[n_points], point-wise predicted class id
-            label: same shape as `pred`, ground-truth class id
-            n_grid: int, how many points the model actually saw
-        Returns:
-            dict, `<metric>_cw` holds per-class values (NaN where the class is
-            absent from this volume) and the rest are volume-level scalars.
+        """all metrics of a single volume, at full resolution -- see
+        `pointcept.utils.eval_cm.eval_volume` (A10) for the implementation and docstring.
         """
-        # a throw-away evaluator per volume: its `records[metr][c]` is a 1-element
-        # list, which keeps NaN intact. `reduce()` would turn NaN into 0.0 here.
-        evaluator = SemSegEvaluator(
-            n_classes=self.num_classes, bg_classes=[self.bg_class], select=self.metrics
-        )
-        with quiet_nan():
-            evaluator(pred=pred, y=label)
-            row = {
-                "{}_cw".format(m): [float(evaluator.records[m][c][0]) for c in range(self.num_classes)]
-                for m in evaluator.metrics
-            }
-            row["n_points"] = int(label.size)
-            row["n_grid_points"] = int(n_grid)
-            row.update(error_rate(pred, label, self.bg_class))
-            integrity = compute_prediction_integrity(pred, label)
-            row.update({k: integrity[k] for k in ("mean_integrity", "weighted_mean_integrity", "global_integrity")})
-            if self.rib_metrics:
-                row.update(error_rate_rib(pred, label, self.bg_class))
-                row.update(rib_label_acc(pred, label))
-                # left/right and class-wise breakdown of the rib-id shift
-                shift = rib_id_shift_rate(pred, label)
-                row.update({k: shift[k] for k in ("nsr_left", "nsr_right", "fsr_left", "fsr_right", "nsr_cw", "fsr_cw")})
-        return row
+        return eval_volume(pred, label, n_grid, self.num_classes, self.bg_class, self.metrics, self.rib_metrics)
 
     def reduce(self, records, conf_mat):
-        """average every per-volume record across volumes"""
-        n_cls = self.num_classes
-        order = sorted(records, key=natural_sort_key)
-        fg = [c for c in range(n_cls) if c != self.bg_class]
-
-        # class-wise overlap metrics, via SemSegEvaluator's own aggregation path
-        evaluator = SemSegEvaluator(
-            n_classes=n_cls, bg_classes=[self.bg_class], select=self.metrics
-        )
-        for name in order:
-            evaluator.load_from_dict(records[name])
-        with quiet_nan():
-            summary = evaluator.reduce()
-
-        # `reduce()` averages over every class including background, which the
-        # background dominates. Redo the overall number over foreground only,
-        # still averaging per volume first.
-        for m in self.metrics:
-            cls_by_vol = np.asarray(
-                [[records[n]["{}_cw".format(m)][c] for n in order] for c in fg], dtype=float
-            )  # [n_fg_classes, n_volumes]
-            per_volume = nanmean(cls_by_vol, axis=0)
-            summary["{}_fg".format(m)] = nanmean(per_volume)
-            summary["{}_fg_vol".format(m)] = calc_stat(per_volume, percentages=[5, 25, 50, 75, 95], prec=4)
-
-        # volume-level scalars: error rates, label accuracy, integrity, sizes
-        for k, v in records[order[0]].items():
-            if k.endswith("_cw") or not isinstance(v, (int, float)):
-                continue
-            vals = np.asarray([records[n].get(k, np.nan) for n in order], dtype=float)
-            summary[k] = nanmean(vals)
-            summary[k + "_vol"] = calc_stat(vals, percentages=[5, 25, 50, 75, 95], prec=4)
-
-        if not self.rib_metrics:
-            return summary
-
-        # Is the residual rib-vs-rib confusion concentrated on adjacent ribs?
-        # A dominant off-by-one band means the model cannot count ribs from the
-        # top, i.e. it is missing global context rather than local shape.
-        rib = np.arange(1, n_cls)
-        fg_cm = conf_mat[1:, 1:].astype(np.float64)
-        offset = np.abs(rib[:, None] - rib[None, :])
-        cross_side = ((rib[:, None] == 12) & (rib[None, :] == 13)) | \
-                     ((rib[:, None] == 13) & (rib[None, :] == 12))
-        wrong = fg_cm.sum() - np.trace(fg_cm)
-        summary["fg_confusion"] = {
-            "n_wrong_rib_points": int(wrong),
-            "off_by_1_share": float(fg_cm[(offset == 1) & ~cross_side].sum() / max(wrong, 1.0)),
-            "off_by_2_share": float(fg_cm[(offset == 2) & ~cross_side].sum() / max(wrong, 1.0)),
-            "cross_side_share": float(fg_cm[cross_side].sum() / max(wrong, 1.0)),
-        }
-        return summary
+        """average every per-volume record across volumes -- see
+        `pointcept.utils.eval_cm.reduce_records` (A10) for the implementation and docstring.
+        """
+        return reduce_records(records, conf_mat, self.num_classes, self.bg_class, self.metrics, self.rib_metrics)

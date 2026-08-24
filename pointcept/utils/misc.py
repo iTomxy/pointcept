@@ -233,6 +233,56 @@ def make_dirs(dir_name):
         os.makedirs(dir_name, exist_ok=True)
 
 
+def staging_dir(final_path, suffix=".tmp"):
+    """Directory to build `final_path` in, so it only appears once complete.
+
+    Half of the pair with `publish_dir`. A producer that writes through these
+    two lets any consumer take the existence of `final_path` as proof the job
+    finished, instead of counting entries and guessing at what the total should
+    have been -- a guess only the producer can actually make.
+
+    The staging directory is deliberately NOT cleared. Producers here skip
+    outputs they already wrote, so an interrupted run resumes into it and costs
+    only what it had not done; wiping it would turn every interruption into a
+    full redo.
+    Args:
+        final_path: str, where the directory will end up
+        suffix: str = ".tmp", appended to `final_path` to name the staging one.
+            A sibling, so the rename in `publish_dir` stays within one filesystem.
+    Returns:
+        tmp_path: str, the staging directory, created if absent
+    """
+    tmp_path = final_path.rstrip(os.sep) + suffix
+    os.makedirs(tmp_path, exist_ok=True)
+    return tmp_path
+
+
+def publish_dir(tmp_path, final_path):
+    """Publish a staging directory under its final name. See `staging_dir`.
+
+    `os.rename` within one filesystem is atomic, so `final_path` never exists
+    half-written -- which is exactly what lets a consumer read its existence as
+    completeness.
+
+    When `final_path` already holds results the entries are moved across one by
+    one instead. That happens when two runs deliberately share a directory --
+    the volume-wise tester dumping a second split beside the first, say -- and
+    it is NOT atomic, so do not race two producers onto one final path.
+    Args:
+        tmp_path: str, the staging directory, as returned by `staging_dir`
+        final_path: str, where it should end up
+    Returns:
+        final_path: str
+    """
+    if not os.path.exists(final_path):
+        os.rename(tmp_path, final_path)
+        return final_path
+    for name in os.listdir(tmp_path):
+        os.replace(os.path.join(tmp_path, name), os.path.join(final_path, name))
+    os.rmdir(tmp_path)
+    return final_path
+
+
 def find_free_port():
     import socket
 

@@ -18,11 +18,24 @@ class Ribsegv2Dataset(DefaultDataset):
         ./transform.py/index_operator/"index_valid_keys"
     for details.
     """
+    def __init__(self, cache_root=None, **kwargs):
+        """
+        cache_root: str = None, directory of preprocessed .npz volumes;
+            defaults to {data_root}/pt_preproc. Point at
+            <stage-1 log>/pt_preproc-binpred for a stage-2 run -- see
+            preproc.preprocess_ptcloud.
+        """
+        # set before super().__init__, which calls self.get_data_list() at
+        # the end and get_data() may run before this returns.
+        self.cache_root = os.path.expanduser(cache_root) if cache_root else None
+        super(Ribsegv2Dataset, self).__init__(**kwargs)
+
     def get_data_list(self):
         return SPLITS[self.split]
 
     def get_data(self, idx):
         volume_id = self.data_list[idx % len(self.data_list)]
+        cache_root = self.cache_root or os.path.join(self.data_root, "pt_preproc")
         return {
             "name": str(volume_id),
             "index_valid_keys": ["coord", "strength", "segment", "voxel_index"], # don't use tuple
@@ -30,8 +43,11 @@ class Ribsegv2Dataset(DefaultDataset):
             # "segment": os.path.join(self.data_root, "label", "RibFrac{}-rib-seg.nii.gz".format(volume_id)),
             # "intensity": os.path.join(self.data_root, "preproc_crop", "{}-image.nii.gz".format(volume_id)),
             # "segment": os.path.join(self.data_root, "preproc_crop", "{}-label.nii.gz".format(volume_id)),
-            "npz": os.path.join(self.data_root, "pt_preproc", "{}.npz".format(volume_id)),
-            "sieve_mask": os.path.join(self.data_root, "binpred", "{}.nii.gz".format(volume_id)),
+            "npz": os.path.join(cache_root, "{}.npz".format(volume_id)),
+            # legacy of the online-sieving pipeline: the sieve is now applied offline by
+            # preproc.preprocess_ptcloud(binpred_path=...), and under ReadNpz this key stays
+            # a string that nothing consumes.
+            # "sieve_mask": os.path.join(self.data_root, "binpred", "{}.nii.gz".format(volume_id)),
         }
 
 
@@ -55,11 +71,18 @@ class Ribsegv2VolumeDataset(Dataset):
         transform=None,
         add_trainval_incomplete=False, # also test on incomplete volumes from train & val
         test_all_incomplete=False, # test on incomplete volumes only, from every split
+        cache_root=None, # str, dir of preprocessed .npz volumes; see docstring below
     ):
+        """
+        cache_root: str = None, directory of preprocessed .npz volumes; defaults
+            to {data_root}/pt_preproc. Point at <stage-1 log>/pt_preproc-binpred
+            for a stage-2 run -- see preproc.preprocess_ptcloud.
+        """
         super(Ribsegv2VolumeDataset, self).__init__()
         self.split = split
         self.data_root = data_root
         self.transform = Compose(transform)
+        self.cache_root = os.path.expanduser(cache_root) if cache_root else os.path.join(data_root, "pt_preproc")
 
         if test_all_incomplete:
             print("Test with all incomplete volumes from train, val and test set.")
@@ -83,8 +106,11 @@ class Ribsegv2VolumeDataset(Dataset):
         volume_id = self.data_list[idx]
         data_dict = self.transform({
             "index_valid_keys": list(self.INDEX_VALID_KEYS),
-            "npz": os.path.join(self.data_root, "pt_preproc", "{}.npz".format(volume_id)),
-            "sieve_mask": os.path.join(self.data_root, "binpred", "{}.nii.gz".format(volume_id)),
+            "npz": os.path.join(self.cache_root, "{}.npz".format(volume_id)),
+            # legacy of the online-sieving pipeline: the sieve is now applied offline by
+            # preproc.preprocess_ptcloud(binpred_path=...), and under ReadNpz this key stays
+            # a string that nothing consumes.
+            # "sieve_mask": os.path.join(self.data_root, "binpred", "{}.nii.gz".format(volume_id)),
         })
         # after Collect, which keeps only the keys it was asked for
         data_dict["name"] = str(volume_id)

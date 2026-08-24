@@ -3,6 +3,8 @@ import numpy as np
 import medpy.metric.binary as mmb
 import torch
 
+from pointcept.utils.misc import quiet_nan, nanmean, calc_stat, natural_sort_key
+
 
 def clswise_cm_metrics_dist(tp, tn, fp, fn):
     """class-wise Confusion Matrix based metrics & counting
@@ -552,7 +554,7 @@ class SemSegEvaluator:
         for metr in self.metrics:
             # self.records[metr] = [[]] * self.n_classes # wrong
             self.records[metr] = [[] for _ in range(self.n_classes)]
-        for metr in self.DISTANCE_BASED:
+        for metr in self.DISTANCE_BASED + ("recall", "sensitivity", "precision"):
             if metr in self.metrics:
                 self.records[f"empty_gt_{metr}"] = [0] * self.n_classes
                 self.records[f"empty_pred_{metr}"] = [0] * self.n_classes
@@ -667,3 +669,122 @@ class SemSegEvaluator:
                 res[metr] = float(np.round(avg, prec))
 
         return res
+
+
+# Default metric set for the RibSegv2 volume-wise reports. Lives here rather than
+# on `Ribsegv2VolumeTester` so a CPU-only post-processing script (e.g.
+# tools/combine_2stage.py) can score with the same set without importing
+# pointcept.engines.test, which pulls in the `pointops` CUDA extension.
+RIBSEG_DEFAULT_METRICS = ("dice", "iou", "precision", "recall", "specificity", "accuracy")
+
+
+def eval_volume(pred, label, n_grid, num_classes, bg_class, metrics, rib_metrics=False):
+    """all metrics of a single volume, at full resolution
+
+    Extracted from `Ribsegv2VolumeTester.eval_volume` (A10) so it can be reused
+    from a plain script (e.g. `tools/combine_2stage.py`) without a CUDA model
+    or a dataloader behind it.
+    Args:
+        pred: int numpy.ndarray[n_points], point-wise predicted class id
+        label: same shape as `pred`, ground-truth class id
+        n_grid: int, how many points the model actually saw
+        num_classes: int, #classes
+        bg_class: int, class id of background
+        metrics: List[str], subset of SemSegEvaluator.METRICS to compute
+        rib_metrics: bool = False, also report the rib-index metrics (shift
+            rates, label accuracy, off-by-one confusion). They hard-code the
+            25-class rib set; only set this for that class count.
+    Returns:
+        dict, `<metric>_cw` holds per-class values (NaN where the class is
+        absent from this volume) and the rest are volume-level scalars.
+    """
+    # a throw-away evaluator per volume: its `records[metr][c]` is a 1-element
+    # list, which keeps NaN intact. `reduce()` would turn NaN into 0.0 here.
+    evaluator = SemSegEvaluator(
+        n_classes=num_classes, bg_classes=[bg_class], select=metrics
+    )
+    with quiet_nan():
+        evaluator(pred=pred, y=label)
+        row = {
+            "{}_cw".format(m): [float(evaluator.records[m][c][0]) for c in range(num_classes)]
+            for m in evaluator.metrics
+        }
+        row["n_points"] = int(label.size)
+        row["n_grid_points"] = int(n_grid)
+        row.update(error_rate(pred, label, bg_class))
+        integrity = compute_prediction_integrity(pred, label)
+        row.update({k: integrity[k] for k in ("mean_integrity", "weighted_mean_integrity", "global_integrity")})
+        if rib_metrics:
+            row.update(error_rate_rib(pred, label, bg_class))
+            row.update(rib_label_acc(pred, label))
+            # left/right and class-wise breakdown of the rib-id shift
+            shift = rib_id_shift_rate(pred, label)
+            row.update({k: shift[k] for k in ("nsr_left", "nsr_right", "fsr_left", "fsr_right", "nsr_cw", "fsr_cw")})
+    return row
+
+
+def reduce_records(records, conf_mat, num_classes, bg_class, metrics, rib_metrics=False):
+    """average every per-volume record across volumes
+
+    Extracted from `Ribsegv2VolumeTester.reduce` (A10); see `eval_volume` above
+    for why.
+    Args:
+        records: dict, volume id -> the dict `eval_volume` returned for it
+        conf_mat: int numpy.ndarray[num_classes, num_classes], summed across volumes
+        num_classes: int, #classes
+        bg_class: int, class id of background
+        metrics: List[str], subset of SemSegEvaluator.METRICS `records` was built with
+        rib_metrics: bool = False, also reduce the rib-index metrics; must match
+            what `eval_volume` was called with, since it decides which keys are present.
+    """
+    n_cls = num_classes
+    order = sorted(records, key=natural_sort_key)
+    fg = [c for c in range(n_cls) if c != bg_class]
+
+    # class-wise overlap metrics, via SemSegEvaluator's own aggregation path
+    evaluator = SemSegEvaluator(
+        n_classes=n_cls, bg_classes=[bg_class], select=metrics
+    )
+    for name in order:
+        evaluator.load_from_dict(records[name])
+    with quiet_nan():
+        summary = evaluator.reduce()
+
+    # `reduce()` averages over every class including background, which the
+    # background dominates. Redo the overall number over foreground only,
+    # still averaging per volume first.
+    for m in metrics:
+        cls_by_vol = np.asarray(
+            [[records[n]["{}_cw".format(m)][c] for n in order] for c in fg], dtype=float
+        )  # [n_fg_classes, n_volumes]
+        per_volume = nanmean(cls_by_vol, axis=0)
+        summary["{}_fg".format(m)] = nanmean(per_volume)
+        summary["{}_fg_vol".format(m)] = calc_stat(per_volume, percentages=[5, 25, 50, 75, 95], prec=4)
+
+    # volume-level scalars: error rates, label accuracy, integrity, sizes
+    for k, v in records[order[0]].items():
+        if k.endswith("_cw") or not isinstance(v, (int, float)):
+            continue
+        vals = np.asarray([records[n].get(k, np.nan) for n in order], dtype=float)
+        summary[k] = nanmean(vals)
+        summary[k + "_vol"] = calc_stat(vals, percentages=[5, 25, 50, 75, 95], prec=4)
+
+    if not rib_metrics:
+        return summary
+
+    # Is the residual rib-vs-rib confusion concentrated on adjacent ribs?
+    # A dominant off-by-one band means the model cannot count ribs from the
+    # top, i.e. it is missing global context rather than local shape.
+    rib = np.arange(1, n_cls)
+    fg_cm = conf_mat[1:, 1:].astype(np.float64)
+    offset = np.abs(rib[:, None] - rib[None, :])
+    cross_side = ((rib[:, None] == 12) & (rib[None, :] == 13)) | \
+                 ((rib[:, None] == 13) & (rib[None, :] == 12))
+    wrong = fg_cm.sum() - np.trace(fg_cm)
+    summary["fg_confusion"] = {
+        "n_wrong_rib_points": int(wrong),
+        "off_by_1_share": float(fg_cm[(offset == 1) & ~cross_side].sum() / max(wrong, 1.0)),
+        "off_by_2_share": float(fg_cm[(offset == 2) & ~cross_side].sum() / max(wrong, 1.0)),
+        "cross_side_share": float(fg_cm[cross_side].sum() / max(wrong, 1.0)),
+    }
+    return summary

@@ -180,6 +180,39 @@ def match_skeleton(points, skeleton):
     return skeleton[idx]
 
 
+def remove_statistical_outlier(points, nb_neighbors=20, std_ratio=2.0):
+    """Indices of points whose mean k-NN distance is not an outlier.
+
+    Reimplements Open3D's `PointCloud.remove_statistical_outlier` on scipy's
+    cKDTree, since open3d is not installed in this environment. Matches its
+    semantics: the k-NN search includes the point itself (distance 0), the
+    spread uses the SAMPLE standard deviation (ddof=1), and points at exactly
+    zero mean distance (full duplicates) are dropped along with the far ones.
+    Input:
+        points: float[n, 3]
+        nb_neighbors: int = 20, how many neighbours (including self) to average
+            the distance over
+        std_ratio: float = 2.0, how many std's beyond the mean counts as far
+    Output:
+        keep_idx: int[k], indices of points to KEEP
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.shape[0] <= 1:
+        return np.arange(points.shape[0])
+    neighbours = min(nb_neighbors, points.shape[0])
+    # workers=-1: parallelise the k-NN query across all CPU cores. Open3D's
+    # remove_statistical_outlier is parallelised C++; scipy's query is
+    # single-threaded by default, and this runs on ~2e6 points per volume
+    # across 657 volumes. Measured on data/ribsegv2/pt_preproc/1.npz
+    # (2,009,729 points, scipy 1.18.0): build 0.7s, serial query 8.1s
+    # (~1.5h over 657 volumes) vs workers=-1 1.5s (~0.3h); distances are
+    # bit-identical either way. `workers` was named `n_jobs` before scipy 1.6.
+    distances, _ = cKDTree(points).query(points, k=neighbours, workers=-1)
+    mean_distance = np.atleast_2d(distances).mean(axis=1)
+    threshold = mean_distance.mean() + std_ratio * mean_distance.std(ddof=1)
+    return np.flatnonzero((mean_distance > 0) & (mean_distance < threshold))
+
+
 def adjust_spacing(points, old_spacing, new_spacing):
     """(7 Oct 2025, iTom) NOT TESTED
     Adjust point coordinates for new spacing.
