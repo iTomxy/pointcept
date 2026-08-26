@@ -145,8 +145,8 @@ CPU-only queues are far longer: `workq` 200 h, `medq` 100 h.
 
 - janus0 (login node): [hardware-info/hwinfo-janus0-login.md](hardware-info/hwinfo-janus0-login.md)
 - venus: [venus7](hardware-info/hwinfo-venus7-gpu.md), [venus11](hardware-info/hwinfo-venus11-gpu.md)
-- mars:
-- saturn:
+- mars: [mars4](hardware-info/hwinfo-mars4-gpu.md)
+- saturn: [saturn2](hardware-info/hwinfo-saturn2-gpu.md)
 
 ### venus7 / venus11 (GPU nodes — both identical)
 
@@ -170,6 +170,61 @@ CPU-only queues are far longer: `workq` 200 h, `medq` 100 h.
 ### janus0 (login node — collected)
 
 `host: janus0.ihpc.uts.edu.au` (full report: `plans/hardware-info/hwinfo-janus0-login.md`).
+
+### mars (GPU nodes — mars4 collected 2026-08-26)
+
+### saturn (GPU nodes — saturn2 collected 2026-08-26)
+
+### mars4 (GPU node — collected 2026-08-26)
+
+Full report: `plans/hardware-info/hwinfo-mars4-gpu.md`
+
+| item | value |
+|---|---|
+| OS / glibc | RHEL 8.10, glibc 2.28 |
+| CPU / RAM | AMD EPYC 9354P, 32c/32t, 188 GiB |
+| GPU | 2 × NVIDIA L4, `sm_89` (8.9), 23 GiB each, driver **570.144** (CUDA ≤ 12.8) |
+| GPU topology | GPU0 ↔ GPU1 via SYS (PCIe + SMP); NUMA 0 / 1 split (GPU0: NUMA 1, GPU1: NUMA 0) |
+| apptainer | absent |
+| singularity | 4.2.2 — **userns build capable: yes**, `--nv` passthrough: **ok** |
+| docker | absent |
+| podman | 4.9.4-rhel |
+| storage | `/home` 48G free (NFS), `/tmp` 252G (local NVMe), `/scratch` 1.4T (local NVMe), `/data` 4.8P (NFS), `/share` 27G (NFS, 99% full) |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly) |
+| host CUDA | no nvcc, module system available |
+
+> **Notes for image placement & build:**
+> - Singularity 4.2.2 works with `--nv` passthrough. Build images on this node using `/tmp` (250G+ local NVMe) as `APPTAINER_TMPDIR`.
+> - Driver 570.144 ≥ 570, so **supports CUDA 12.8 + Blackwell (sm_120)**.
+> - GPU topology: 2× L4 on separate NUMA nodes (SYS connection), peer-to-peer via PCIe + SMP.
+> - No scheduler means jobs run interactively — no walltime caps.
+
+### saturn2 (GPU node — collected 2026-08-26)
+
+Full report: `plans/hardware-info/hwinfo-saturn2-gpu.md`
+
+| item | value |
+|---|---|
+| OS / glibc | RHEL 8.10, glibc 2.28 |
+| CPU / RAM | AMD EPYC 9254, 24c/24t, 188 GiB |
+| GPU | 2 × NVIDIA L40, `sm_89` (8.9), 46 GiB each, driver **570.144** (CUDA ≤ 12.8) |
+| GPU topology | GPU0 ↔ GPU1 via SYS (PCIe + SMP); NUMA 0 / 1 split (GPU0: NUMA 1, GPU1: NUMA 0) |
+| apptainer | absent |
+| singularity | 4.2.2 — **userns build capable: yes**, `--nv` passthrough: **ok** |
+| docker | absent |
+| podman | 4.9.4-rhel |
+| storage | `/home` 48G free (NFS), `/tmp` 254G (local NVMe), `/scratch` 1.6T (local NVMe), `/data` 4.8P (NFS), `/share` 27G (NFS, 99% full) |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly) |
+| host CUDA | no nvcc, module system available |
+
+> **Notes for image placement & build:**
+> - Singularity 4.2.2 works with `--nv` passthrough. Build images on this node using `/tmp` (250G+ local NVMe) as `APPTAINER_TMPDIR`.
+> - Driver 570.144 ≥ 570, so **supports CUDA 12.8 + Blackwell (sm_120)**.
+> - GPU topology: 2× L40 on separate NUMA nodes (SYS connection), peer-to-peer via PCIe + SMP.
+> - L40 has 46 GiB VRAM (2x L4) — better for large batch sizes.
+> - No scheduler means jobs run interactively — no walltime caps.
 
 | item | value |
 |---|---|
