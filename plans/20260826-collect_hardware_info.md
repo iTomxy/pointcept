@@ -5,7 +5,7 @@ as the base of building a new Pointcept docker image.
 
 # How
 
-Run [collect-hwinfo.sh](#collect-hwinfosh) **twice per cluster**:
+Run [tmp-ai-collect-hwinfo.sh](../tmp-ai-collect-hwinfo.sh) (inlined below) **twice per cluster**:
 
 1. **Head/login node** — storage, network egress, scheduler, build capability.
 2. **GPU node** — driver, compute capability, GPU memory, topology.
@@ -14,11 +14,11 @@ Run [collect-hwinfo.sh](#collect-hwinfosh) **twice per cluster**:
 
 ```bash
 # pass 1 (login node)
-bash collect-hwinfo.sh hwinfo-<cluster>-login.md
+bash tmp-ai-collect-hwinfo.sh hwinfo-<cluster>-login.md
 
 # pass 2 (gpu node) -- cetus, via a short interactive job
 qsub -I -q small_gpuq -l select=1:ncpus=4:ngpus=1 -l walltime=00:20:00
-bash collect-hwinfo.sh hwinfo-<cluster>-gpu.md
+bash tmp-ai-collect-hwinfo.sh hwinfo-<cluster>-gpu.md
 ```
 
 The script never aborts: every probe degrades to `n/a`, so an unfamiliar
@@ -90,7 +90,7 @@ openpoints / pointnext-lightning conda env is built against the **host**.
 |---|---|
 | OS / glibc | RHEL 8.10, glibc 2.28 |
 | CPU / RAM | Xeon Gold 5122, 8 logical cpus, 92 GiB |
-| GPU nodes | RTX PRO 6000 Blackwell, `sm_120` (driver version **still to collect**) |
+| GPU nodes | **two classes** (both collected 2026-08-26): 48‑cpu exec `hpc-exec05`-`23` = RTX PRO 6000 Blackwell `sm_120` 96 GiB; 24‑cpu exec `hpc-exec01`-`04` = Quadro RTX 6000 `sm_75` 24 GiB. driver **580.142** on both |
 | apptainer | 1.5.3 — **can build locally** with `--fakeroot --ignore-fakeroot-command` |
 | docker | absent |
 | storage | `/shared/homes` 793 GB free; **`/` only 15 GB — must redirect APPTAINER_TMPDIR** |
@@ -115,6 +115,43 @@ CPU-only queues are far longer: `workq` 200 h, `medq` 100 h.
 > jobs that need its larger per-job resources.
 >
 > Image builds need **no GPU** — build on the login node, or in `workq`.
+
+### cetus GPU node — `hpc-exec19` via `large_gpuq` (collected 2026-08-26)
+
+Full report: [hardware-info/hwinfo-cetus-large_gpuq-gpu.md](hardware-info/hwinfo-cetus-large_gpuq-gpu.md)
+
+| item | value |
+|---|---|
+| GPU | 2 × RTX PRO 6000 Blackwell Server Edition, `sm_120`, **96 GiB each** |
+| driver | **580.142** (CUDA <= 13.0) — the most modern driver of any cluster |
+| CPU / RAM | AMD EPYC 9255 24c/48t, 377 GiB |
+| apptainer | 1.5.3, userns build capable, **`--nv` passthrough: ok** |
+| storage | `/scratch` 2.9 T free (local NVMe), `/` 1.3 T free |
+| host CUDA | **`nvcc` absent on compute nodes** (only the login node has 12.8) |
+
+> Two collection caveats worth remembering:
+> - `nproc` reported **4**, not 48 — inside a PBS job it reflects the cgroup
+>   allocation (`ncpus=4` was requested), not the node. Right number for sizing
+>   `MAX_JOBS`, wrong one for describing the hardware; `lscpu` gives the node.
+> - `nvcc` is absent on compute nodes, so any from-source CUDA build must happen
+>   on the login node — or inside a container that carries its own toolkit.
+
+### cetus GPU node — `hpc-exec03` via `small_gpuq`/`med_gpuq` (collected 2026-08-26)
+
+Full report: [hardware-info/hwinfo-cetus-small_gpuq-gpu.md](hardware-info/hwinfo-cetus-small_gpuq-gpu.md) (and `…-med_gpuq-gpu.md`, same host).
+
+| item | value |
+|---|---|
+| GPU | 2 × **Quadro RTX 6000**, `sm_75` (**7.5**), **24 GiB each** |
+| driver | **580.142** (CUDA <= 13.0) — identical to the 48‑cpu class |
+| CPU / RAM | Intel Xeon Gold 6226, 187 GiB (the 24‑cpu exec class) |
+| apptainer | 1.5.3, userns build capable, **`--nv` passthrough: ok** |
+| storage | `/scratch` 11 T free (local), `/` 618 G free; `/var` only 15 G — redirect `APPTAINER_TMPDIR` off `/var/tmp` |
+| host CUDA | `nvcc` absent on compute nodes |
+
+> **This is the architecture the earlier plan nearly dropped.** The proposed
+> `8.6;8.9;12.0+PTX` list would have made every job on `hpc-exec01`-`04` fail to
+> find a kernel image. `7.5` must stay in `TORCH_CUDA_ARCH_LIST`.
 
 ## cbai — `strax-server2`
 
@@ -167,13 +204,34 @@ CPU-only queues are far longer: `workq` 200 h, `medq` 100 h.
 
 > **Note:** venus7 and venus11 are identical GPU nodes. Both have driver 570.144 ≥ 570, so they **support CUDA 12.8 + Blackwell**. Singularity works with `--nv` passthrough. No scheduler means jobs run interactively or via custom dispatch. Build images on login node (not collected yet) or use `/tmp` (250G+ local NVMe) as `APPTAINER_TMPDIR`.
 
-### janus0 (login node — collected)
+### janus0 (login node — collected 2026-08-26)
 
-`host: janus0.ihpc.uts.edu.au` (full report: `plans/hardware-info/hwinfo-janus0-login.md`).
+Full report: [hardware-info/hwinfo-janus0-login.md](hardware-info/hwinfo-janus0-login.md)
 
-### mars (GPU nodes — mars4 collected 2026-08-26)
+| item | value |
+|---|---|
+| OS / glibc | RHEL 8.10, glibc 2.28 |
+| CPU / RAM | 2 × AMD EPYC 9254 (24c) = 48 logical cpus, 188 GiB |
+| GPU | login node — `nvidia-smi` ABSENT (no driver, as expected) |
+| apptainer | **absent** |
+| singularity | **absent** |
+| docker | absent |
+| podman | 4.9.4-rhel — only runtime present; no apptainer/singularity to build a `.sif` here |
+| storage | `/home` 8.0G free (NFS, 64G quota, 88% full); `/tmp` 122G free (local); `/scratch` 362G free (local `/dev/sdb1`); `/data` 4.8P free (NFS); `/share` 27G free but **99% full** |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly; same as the venus GPU nodes) |
+| host CUDA | no nvcc, module system available |
 
-### saturn (GPU nodes — saturn2 collected 2026-08-26)
+> **Notes for image placement & build:**
+> - The `.sif` **must be built on a venus node** (singularity 4.2.2), not janus0 —
+>   janus0 has only podman and cannot produce an apptainer/singularity image.
+> - `/home` is NFS with a 64G quota (8G free) — too tight for a 10-20G `.sif`.
+>   Store the built `.sif` on **`/data`** (NFS, 4.8P free, shared with venus nodes)
+>   or in `/scratch` (local to janus0, not shared). Use `/tmp` or `/scratch` as
+>   `APPTAINER_TMPDIR` for the build on the venus node (NVMe, 250G+).
+> - `/share` is effectively full (99%); do not use it.
+> - No scheduler anywhere on iHPC, so builds/training run interactively or via
+>   custom dispatch — no walltime-cap surprises like on cetus.
 
 ### mars4 (GPU node — collected 2026-08-26)
 
@@ -226,30 +284,184 @@ Full report: `plans/hardware-info/hwinfo-saturn2-gpu.md`
 > - L40 has 46 GiB VRAM (2x L4) — better for large batch sizes.
 > - No scheduler means jobs run interactively — no walltime caps.
 
-| item | value |
-|---|---|
-| OS / glibc | RHEL 8.10, glibc 2.28 |
-| CPU / RAM | 2 × AMD EPYC 9254 (24c) = 48 logical cpus, 188 GiB |
-| GPU | login node — `nvidia-smi` ABSENT (no driver, as expected) |
-| apptainer | **absent** |
-| singularity | **absent** |
-| docker | absent |
-| podman | 4.9.4-rhel — only runtime present; no apptainer/singularity to build a `.sif` here |
-| storage | `/home` 8.0G free (NFS, 64G quota, 88% full); `/tmp` 122G free (local); `/scratch` 362G free (local `/dev/sdb1`); `/data` 4.8P free (NFS); `/share` 27G free but **99% full** |
-| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
-| scheduler | **none** (run jobs directly; same as the venus GPU nodes) |
-| host CUDA | no nvcc, module system available |
+# Synthesis — what the image must be
 
-> **Notes for image placement & build:**
-> - The `.sif` **must be built on a venus node** (singularity 4.2.2), not janus0 —
->   janus0 has only podman and cannot produce an apptainer/singularity image.
-> - `/home` is NFS with a 64G quota (8G free) — too tight for a 10-20G `.sif`.
->   Store the built `.sif` on **`/data`** (NFS, 4.8P free, shared with venus nodes)
->   or in `/scratch` (local to janus0, not shared). Use `/tmp` or `/scratch` as
->   `APPTAINER_TMPDIR` for the build on the venus node (NVMe, 250G+).
-> - `/share` is effectively full (99%); do not use it.
-> - No scheduler anywhere on iHPC, so builds/training run interactively or via
->   custom dispatch — no walltime-cap surprises like on cetus.
+## GPU matrix
+
+| cluster | node | GPU | `sm` | VRAM | count | driver | max CUDA |
+|---|---|---|---|---|---|---|---|
+| cetus (exec 24‑cpu, `hpc-exec01`‑`04`) | `hpc-exec03` | Quadro RTX 6000 | **7.5** | 24 GiB | 2 | 580.142 | 13.0 |
+| cetus (exec 48‑cpu, `hpc-exec05`‑`23`) | `hpc-exec19` | RTX PRO 6000 Blackwell | **12.0** | 96 GiB | 2 | 580.142 | 13.0 |
+| cbai | `strax-server2` | RTX A4000 | **8.6** | 16 GiB | 4 | 580.95.05 | 13.0 |
+| iHPC | `venus7`, `venus11` | RTX A5500 | **8.6** | 24 GiB | 2 | 570.144 | **12.8** |
+| iHPC | `mars4` | L4 | **8.9** | 23 GiB | 2 | 570.144 | **12.8** |
+| iHPC | `saturn2` | L40 | **8.9** | 46 GiB | 2 | 570.144 | **12.8** |
+
+## Decisions this settles
+
+**Arch list: `TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;12.0+PTX"`.** The union of every
+GPU in use is now four architectures — and the earlier proposal of
+`8.6;8.9;12.0+PTX` was **wrong**: cetus's 24‑cpu exec class (`hpc-exec01`‑`04`)
+carries **Quadro RTX 6000, `sm_7.5`**, so `7.5` *is* needed and must stay. The
+current [env.sh](../env.sh) default (`7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX`) only
+needs `8.0`, `9.0` and `10.0` dropped — those three genuinely run nowhere in this
+fleet (cbai 8.6; iHPC 8.6/8.9; cetus 7.5/12.0). `12.0+PTX` keeps forward
+compatibility for future hardware via PTX JIT.
+
+> **Caveat — cetus desk class not yet collected.** `hpc-desk01`‑`07` (1 GPU each,
+> in `iworkq`, currently **offline**) may carry a *fourth* architecture. If any
+> desk node is a training target, sample it with `iworkq` before locking the list.
+> The 24‑cpu and 48‑cpu exec classes are confirmed above.
+
+**CUDA 12.8 is a ceiling, not a choice.** iHPC's driver 570.144 supports CUDA
+**<= 12.8 exactly**. The pinned 12.8 works everywhere, but there is zero
+headroom: bumping the image to CUDA 12.9 or 13.0 would break all four iHPC
+nodes while remaining fine on cbai (13.0) and cetus. Do not raise it without
+re-checking iHPC drivers first.
+
+**Two artifacts are required, from one recipe.**
+
+| cluster | runtime available | artifact |
+|---|---|---|
+| cetus | apptainer 1.5.3 | `.sif` |
+| iHPC GPU nodes | singularity-ce 4.2.2 (site wrapper `singularity_build`) | `.sif` |
+| iHPC `janus0` | podman only — **cannot build a `.sif`** | — |
+| cbai | docker 28.3.3 only, **`sudo` available** | docker image |
+
+Since every cluster reaches Docker Hub, the cleanest distribution is to build
+and push **once** from cbai (the only host with docker), then on cetus and iHPC:
+
+```bash
+apptainer build pointcept.sif docker://<account>/pointcept:cu128
+```
+
+That avoids copying a 10-20 GB `.sif` between clusters. All three clusters can also build natively — cetus via apptainer, iHPC GPU
+nodes via `singularity_build` (both verified), cbai via `docker build` — so
+per-cluster builds remain a fallback. The cost is keeping the recipe in sync
+across two files, as [Dockerfile](../Dockerfile) and
+[pointcept.def](../pointcept.def) are today; the registry route keeps one.
+
+## Image placement
+
+| cluster | build scratch (`APPTAINER_TMPDIR`) | store the image |
+|---|---|---|
+| cetus | `/shared/homes/...` — **not `/tmp`** (`/` has only 15 GB) | `/shared/homes` (793 GB) |
+| iHPC | `/tmp` or `/scratch` on a GPU node (NVMe, 250 GB+) | `/data/tliang/` — **1 TiB/user**, shared across all iHPC nodes |
+| cbai | default | `/straxdata` (633 GB) |
+
+> **iHPC placement contradicts [env.md](env.md).** It puts the image at
+> `~/pointcept.sif` with a link in `/share/$(whoami)/`. But `/home` is capped at
+> 32-64 GiB per user and `/share` is **99% full (27 GB left)** — neither holds a
+> 10-20 GB image reliably. Use `/data/tliang/` (1 TiB per user, separate
+> partition, shared across janus0 and every GPU node) so one copy serves all of
+> iHPC.
+
+# Gaps and how they closed
+
+Every open item from the first pass, and what resolved it.
+
+## Resolved
+
+- **cbai build host — confirmed.** `sudo` available, `docker build` works, and a
+  Pointcept image was previously built there and ran on all 4 GPUs. That also
+  confirms the nvidia-container-toolkit path (`--gpus all`) works, so cbai is
+  viable as the single build-and-push host.
+- **iHPC build — confirmed.** `pointcept.sif` was built on an iHPC **GPU node**
+  using the site wrapper `singularity_build`, and runs with GPUs. Note janus0
+  still cannot build (podman only).
+- **iHPC quotas.** `/home/tliang/` is capped at 32-64 GiB per user;
+  `/data/tliang/` at **1 TiB per user**, on a separate partition. 1 TiB is ample
+  for a 10-20 GB image, confirming `/data` as the placement. (This also explains
+  the janus0-vs-saturn2 `/home` discrepancy: `df` was reporting the shared
+  export, not the per-user entitlement.)
+- **cetus GPU count.** `pbsnodes -a` gives 2 GPUs on every `hpc-exec*` node and
+  1 on every `hpc-desk*` node.
+
+## Assessment of [cetus-gpuq-info.md](../cetus-gpuq-info.md)
+
+From the sibling PointNeXt project. Now fully checkable against measurement.
+
+**Confirmed**
+
+- `large_gpuq` contains Blackwell `sm_120` — `hpc-exec19` measured as exactly
+  that, which explains its "no kernel image is available" failures under cu118.
+- `small_gpuq` and `med_gpuq` do map to the `hpc-exec01`-`04` class — both
+  probes landed on `hpc-exec03`, 24 cpu / 187 GiB, matching `pbsnodes`.
+- Including `7.5` in its cu118 arch list was right, for the right reason.
+
+**Wrong or unverified**
+
+- *"small_gpuq / med_gpuq GPU Arch: sm_75/80/86/89"* was a range, not a
+  measurement. The real answer is **`sm_75` — the bottom of it**. Had the image
+  been built on the earlier `8.6;8.9;12.0+PTX` plan, every job on the two
+  long-walltime queues would have failed.
+- *"large_gpuq: compatible hpc-exec06-09 (sm_86/89)"* remains unverified and
+  still sits awkwardly with `pbsnodes`, where `hpc-exec05`-`23` is one uniform
+  class. Only `hpc-exec19` has been measured, and it is Blackwell. Harmless
+  either way: `8.6` and `8.9` are in the list regardless.
+- **Factual error:** it lists "max running per user: 6" for small_gpuq and
+  med_gpuq. Live `qmgr` says **12** for both; only `large_gpuq` is 6.
+- **Its recommendation is unsafe:** `7.5;8.0;8.6;8.9;9.0+PTX` is offered "for
+  Blackwell support" but contains no `12.0`, leaving Blackwell to JIT `sm_90`
+  PTX forward at every process start — slow and not guaranteed.
+
+## Turing consequence: no bf16 on the long-walltime queues
+
+`sm_75` is Turing, which has **no bfloat16 and no TF32** — both arrived with
+Ampere (`sm_80`). FlashAttention also requires `sm_80`+. So on `small_gpuq` and
+`med_gpuq`, the only queues that allow 24-48 h runs:
+
+- a `bf16` mixed-precision config will fail or silently fall back;
+- FlashAttention is unavailable — consistent with [env.sh](../env.sh) already
+  disabling it for the RibSeg PTv3 config, and with `pointcept.def` not
+  installing it.
+
+Use `fp16` AMP or fp32 for anything that must run there, and keep `bf16` for the
+Blackwell nodes. This is a config concern, not an image concern, but it is
+easiest to settle now: a training plan that assumes `bf16` everywhere has no
+long-walltime queue to run on.
+
+## Consequence: VRAM and walltime pull in opposite directions
+
+| queue | nodes | walltime | concurrent | GPU | VRAM |
+|---|---|---|---|---|---|
+| `small_gpuq` | `hpc-exec01`-`04` | **48 h** | 12 | Quadro RTX 6000 (`sm_75`) | 24 GiB |
+| `med_gpuq` | `hpc-exec01`-`04` | **24 h** | 12 | Quadro RTX 6000 (`sm_75`) | 24 GiB |
+| `large_gpuq` | `hpc-exec05`-`23` | **6 h** | 6 | RTX PRO 6000 Blackwell (`sm_120`) | **96 GiB** |
+
+The trade is now fully measured and it is stark: cetus offers either **8× the
+walltime** or **4× the VRAM plus a six-year-newer architecture**, never both.
+
+- Long runs on `small_gpuq`: 48 h, but Turing — 24 GiB, no bf16, no
+  FlashAttention.
+- Blackwell on `large_gpuq`: 96 GiB and full bf16, but a hard 6 h wall, so the
+  run must checkpoint and requeue.
+
+Robust checkpoint-resume is therefore worth more than any image decision here,
+and `large_gpuq` also allows only 6 concurrent jobs against 12 on the others.
+
+> For comparison, iHPC's `saturn2` (2 × L40, 46 GiB, `sm_89`, no scheduler and
+> so no walltime cap at all) may be the better home for long PTv3 runs than
+> either cetus queue. cbai's 4 × A4000 are only 16 GiB each — the smallest VRAM
+> anywhere — but there are four of them and no walltime either.
+
+# All hardware collection complete
+
+Every gate is now measured. Nothing further is needed before writing the image
+recipe:
+
+- driver >= 570 everywhere (cetus 580.142, cbai 580.95.05, iHPC 570.144);
+- CUDA 12.8 is supported everywhere and is the ceiling on iHPC;
+- arch list `7.5;8.6;8.9;12.0+PTX`;
+- build hosts confirmed on all three clusters, `--nv` verified on cetus and iHPC;
+- image placement decided per cluster.
+
+One residual sampling caveat, low risk: `hpc-exec03` stands for the whole
+`hpc-exec01`-`04` class and `hpc-exec19` for `hpc-exec05`-`23`. `pbsnodes` shows
+each class uniform in cpu and memory, so this is a reasonable inference, but a
+job landing on an unsampled node with a different card would be outside the
+measured set. The `7.5;8.6;8.9;12.0+PTX` list covers every architecture seen on
+any cluster, which makes that largely academic.
 
 # collect-hwinfo.sh
 
@@ -261,8 +473,8 @@ Full report: `plans/hardware-info/hwinfo-saturn2-gpu.md`
 # scheduler, build capability) and once on a GPU node (driver, arch, topology).
 # On cetus the GPU pass must go through PBS -- the login node has no driver.
 #
-#   bash collect-hwinfo.sh                 # writes to ./hwinfo-<host>.md
-#   bash collect-hwinfo.sh /path/out.md
+#   bash tmp-ai-collect-hwinfo.sh                 # writes to ./hwinfo-<host>.md
+#   bash tmp-ai-collect-hwinfo.sh /path/out.md
 #
 # Never fails: every probe degrades to "n/a" so one missing tool cannot abort
 # the run on an unfamiliar cluster.
