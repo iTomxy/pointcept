@@ -118,7 +118,28 @@ CPU-only queues are far longer: `workq` 200 h, `medq` 100 h.
 
 ## cbai — `strax-server2`
 
-Not yet collected. Expected: docker, `/straxdata` large disk, no scheduler.
+**Collected: 2026-08-26** (full report: [hardware-info/hwinfo-strax-server2-login.md](hardware-info/hwinfo-strax-server2-login.md))
+
+| item | value |
+|---|---|
+| OS / glibc | Ubuntu 24.04.3 LTS, glibc 2.39 |
+| CPU / RAM | AMD Ryzen Threadripper PRO 3955WX, 16c/32t, 251 GiB |
+| GPU | 4 × RTX A4000, `sm_86` (8.6), 16 GiB each, driver **580.95** (CUDA ≤ 13.0) |
+| GPU topology | All 4 GPUs on NUMA 0, CPU affinity 0-31; peer links via NODE (PCIe + intra-NUMA) |
+| docker | 28.3.3 — **can build locally** |
+| apptainer/singularity | absent |
+| podman | absent |
+| storage | `/` (root) 123G free (916G NVMe); `/straxdata` 633G free (7.3T HDD); home on ext4 (local) |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly) |
+| host CUDA | CUDA 12.0 (`nvcc`), no module system |
+
+> **Notes for image placement & build:**
+> - Docker is the only container runtime; can build images locally with `docker build`
+> - `/straxdata` (633G free) is the best location for built images and datasets
+> - Driver 580.95 ≥ 570, so **supports CUDA 12.8 + Blackwell (sm_120)**
+> - No scheduler means jobs run interactively — no walltime caps
+> - GPU topology: all 4 GPUs on same NUMA node (0), peer-to-peer via NODE (not NVLink)
 
 ## iHPC — `janus0` + `saturn*` / `mars*` / `venus*`
 
