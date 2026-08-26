@@ -122,9 +122,58 @@ Not yet collected. Expected: docker, `/straxdata` large disk, no scheduler.
 
 ## iHPC — `janus0` + `saturn*` / `mars*` / `venus*`
 
-Not yet collected. Needs a GPU pass on **each** of the three node families,
-since their compute capabilities may differ. Home is limited to 64 GiB, so
-check where a `.sif` can be stored (`~/data/` → `/data/$(whoami)/`).
+- janus0 (login node): [hardware-info/hwinfo-janus0-login.md](hardware-info/hwinfo-janus0-login.md)
+- venus: [venus7](hardware-info/hwinfo-venus7-gpu.md), [venus11](hardware-info/hwinfo-venus11-gpu.md)
+- mars:
+- saturn:
+
+### venus7 / venus11 (GPU nodes — both identical)
+
+| item | value |
+|---|---|
+| OS / glibc | RHEL 8.10, glibc 2.28 |
+| CPU / RAM | Xeon Gold 5415+, 8 cores / 16 threads, 125 GiB |
+| GPU | 2 × RTX A5500, `sm_86` (8.6), 24 GiB each, driver **570.144** (CUDA ≤ 12.8) |
+| GPU topology | GPU0 ↔ GPU1 via SYS (PCIe + SMP); NUMA 0 / 1 split |
+| apptainer | absent |
+| singularity | 4.2.2 — **userns build capable: yes**, `--nv` passthrough: **ok** |
+| docker | absent |
+| podman | 4.9.4-rhel |
+| storage | `/home` 8.1G free (NFS), `/tmp` 249G+ (local NVMe), `/data` 4.8P (NFS), `/share` 27G (NFS, 99% full) |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly, no PBS/Slurm on these nodes) |
+| host CUDA | no nvcc, module system available |
+
+> **Note:** venus7 and venus11 are identical GPU nodes. Both have driver 570.144 ≥ 570, so they **support CUDA 12.8 + Blackwell**. Singularity works with `--nv` passthrough. No scheduler means jobs run interactively or via custom dispatch. Build images on login node (not collected yet) or use `/tmp` (250G+ local NVMe) as `APPTAINER_TMPDIR`.
+
+### janus0 (login node — collected)
+
+`host: janus0.ihpc.uts.edu.au` (full report: `plans/hardware-info/hwinfo-janus0-login.md`).
+
+| item | value |
+|---|---|
+| OS / glibc | RHEL 8.10, glibc 2.28 |
+| CPU / RAM | 2 × AMD EPYC 9254 (24c) = 48 logical cpus, 188 GiB |
+| GPU | login node — `nvidia-smi` ABSENT (no driver, as expected) |
+| apptainer | **absent** |
+| singularity | **absent** |
+| docker | absent |
+| podman | 4.9.4-rhel — only runtime present; no apptainer/singularity to build a `.sif` here |
+| storage | `/home` 8.0G free (NFS, 64G quota, 88% full); `/tmp` 122G free (local); `/scratch` 362G free (local `/dev/sdb1`); `/data` 4.8P free (NFS); `/share` 27G free but **99% full** |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly; same as the venus GPU nodes) |
+| host CUDA | no nvcc, module system available |
+
+> **Notes for image placement & build:**
+> - The `.sif` **must be built on a venus node** (singularity 4.2.2), not janus0 —
+>   janus0 has only podman and cannot produce an apptainer/singularity image.
+> - `/home` is NFS with a 64G quota (8G free) — too tight for a 10-20G `.sif`.
+>   Store the built `.sif` on **`/data`** (NFS, 4.8P free, shared with venus nodes)
+>   or in `/scratch` (local to janus0, not shared). Use `/tmp` or `/scratch` as
+>   `APPTAINER_TMPDIR` for the build on the venus node (NVMe, 250G+).
+> - `/share` is effectively full (99%); do not use it.
+> - No scheduler anywhere on iHPC, so builds/training run interactively or via
+>   custom dispatch — no walltime-cap surprises like on cetus.
 
 # collect-hwinfo.sh
 
