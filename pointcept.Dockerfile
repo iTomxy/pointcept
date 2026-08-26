@@ -302,12 +302,27 @@ if missing:
 
 # Read the compiled SASS out of each CUDA op and confirm nothing is absent.
 # pointseg is a CppExtension and carries no device code, so it drops out here.
+#
+# cumm and spconv are deliberately NOT scanned. Both install an extension named
+# core_cc.cpython-*.so — cumm/core_cc and spconv/core_cc — so they collide on
+# basename, and cumm's binding layer legitimately carries only nvcc's default
+# arch. COMPILED_CUDA_ARCHS above is the authoritative record of what those two
+# were compiled for, straight from spconv.core_cc, so scanning them here adds
+# nothing but false alarms. Do not "fix" that collision by keeping whichever
+# file has more architectures: that silently compares two unrelated libraries
+# and would pass a spconv missing a target arch as long as cumm had it.
 site = os.path.dirname(torch.__file__).rsplit("/", 1)[0]
+seen = set()
 for package in ("pointops", "pointops2", "pointgroup_ops", "pointrope",
-                "torch_scatter", "torch_sparse", "torch_cluster",
-                "cumm", "spconv"):
+                "torch_scatter", "torch_sparse", "torch_cluster"):
     for so in glob.glob(f"{site}/{package}/**/*.so", recursive=True) + \
               glob.glob(f"{site}/{package}*.so"):
+        # The two globs overlap (pointops* also matches pointops2*), so key on
+        # the real path to avoid running cuobjdump over the same file twice.
+        so = os.path.realpath(so)
+        if so in seen:
+            continue
+        seen.add(so)
         try:
             out = subprocess.run(["cuobjdump", "--list-elf", so],
                                  capture_output=True, text=True, timeout=120).stdout
@@ -318,7 +333,7 @@ for package in ("pointops", "pointops2", "pointgroup_ops", "pointrope",
             continue          # host-only object
         gap = targets - found
         if gap:
-            problems.append(f"{os.path.basename(so)} missing {sorted(gap)}")
+            problems.append(f"{os.path.relpath(so, site)} missing {sorted(gap)}")
 
 
 def _nccl_version():
