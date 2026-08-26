@@ -329,7 +329,7 @@ def build_pipeline(mode):
         dict(
             type="Collect",
             keys=("coord", "grid_coord", "segment", "inverse",
-                  "origin_segment", "origin_voxel_index") if mode == "test"
+                  "origin_segment", "origin_voxel_index", "affine") if mode == "test"
                  else ("coord", "grid_coord", "segment"),
             feat_keys=feat_keys,
         ),

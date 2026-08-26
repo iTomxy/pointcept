@@ -1362,7 +1362,8 @@ class Ribsegv2VolumeTester(TesterBase):
     def __init__(self, cfg, save_pred=False, metrics=None, save_cm=True, rib_metrics=None,
                  model=None, test_loader=None, verbose=False):
         """
-        save_pred: bool = False, dump full-resolution predictions as {save_path}/result/{vid}.npz
+        save_pred: bool = False, dump full-resolution predictions and their
+            voxel-to-physical affine as {save_path}/result/{vid}.npz
         metrics: List[str] = None, subset of SemSegEvaluator.METRICS; None -> DEFAULT_METRICS
         save_cm: bool = True, dump & plot the aggregated [C, C] confusion matrix
         rib_metrics: bool = None, also report the rib-index metrics (shift rates,
@@ -1442,6 +1443,9 @@ class Ribsegv2VolumeTester(TesterBase):
             inverse = data_dict.pop("inverse").numpy()
             label = data_dict.pop("origin_segment").numpy()
             voxel_index = data_dict.pop("origin_voxel_index").numpy()
+            affine = data_dict.pop("affine", None)
+            if isinstance(affine, torch.Tensor):
+                affine = affine.numpy()
             data_dict.pop("segment", None)  # grid-level label; drop it to take the test branch
             for key in data_dict.keys():
                 if isinstance(data_dict[key], torch.Tensor):
@@ -1460,11 +1464,16 @@ class Ribsegv2VolumeTester(TesterBase):
                 minlength=n_cls * n_cls,
             ).reshape(n_cls, n_cls)
             if self.save_pred:
+                assert affine is not None, (
+                    "volume {}: save_pred requires the test pipeline to Collect `affine`"
+                    .format(name)
+                )
                 np.savez_compressed(
                     os.path.join(save_path, "{}.npz".format(name)),
                     pred=np_smallest_dtype(pred),
                     label=np_smallest_dtype(label),
                     voxel_index=np_smallest_dtype(voxel_index),
+                    affine=affine,
                 )
             batch_time.update(time.time() - end)
             end = time.time()
