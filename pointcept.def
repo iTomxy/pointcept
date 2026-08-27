@@ -1,16 +1,17 @@
 # pointcept
 Bootstrap: docker
-From: pointcept/pointcept:v1.6.0-pytorch2.5.0-cuda12.4-cudnn9-devel
+# From: pointcept/pointcept:v1.6.0-pytorch2.5.0-cuda12.4-cudnn9-devel
+From: tyloeng/pointcept:py3.11-torch2.7.1-cu12.8-cudnn9
 # Bootstrap: localimage
 # From: /share/pointcept_ori.sif
 
 %labels
 
-Python 3.11.10
-CUDA 12.4
+Python 3.11
+CUDA 12.8
 cuDNN 9
-PyTorch 2.5.0+cu124
-torchvision 0.20.0+cu124
+PyTorch 2.7.1+cu128
+torchvision 0.22.1+cu128
 
 %environment
 
@@ -22,16 +23,17 @@ export PYTHONPATH=.
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /data /projects /scratch
 
-# python packages
-/opt/conda/bin/pip install --upgrade pip setuptools wheel
-/opt/conda/bin/pip uninstall -y open3d-cpu
-/opt/conda/bin/pip install --no-cache-dir \
-    scikit-learn scikit-image opencv-python-headless pyyaml \
-    SimpleITK nibabel medpy itk jupyterlab ipykernel open3d seaborn
+# python packages (base image already has pyyaml, open3d, etc.)
+# Use conda for better version compatibility, pip for packages not in conda
+conda install -y -c conda-forge \
+    scikit-learn scikit-image opencv \
+    simpleitk nibabel medpy itk jupyterlab ipykernel seaborn
+pip install --no-cache-dir \
+    opencv-python-headless
 
 # install jupyter kernel
-/opt/conda/bin/python -m ipykernel install --name "pointcept" --display-name "Pointcept (singularity)"
+python -m ipykernel install --name "pointcept" --display-name "Pointcept (singularity)"
 
 # let `py` point to the right python
-ln -s /opt/conda/bin/python /usr/local/bin/py
-ln -s /opt/conda/bin/pip /usr/local/bin/pi
+ln -s /usr/local/bin/python /usr/local/bin/py
+ln -s /usr/local/bin/pip /usr/local/bin/pi
