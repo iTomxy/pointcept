@@ -2,23 +2,132 @@
 # FROM pointcept/pointcept:v1.6.0-pytorch2.5.0-cuda12.4-cudnn9-devel
 FROM tyloeng/pointcept:py3.11-torch2.7.1-cu12.8-cudnn9
 
-# Set labels (equivalent to Singularity %labels)
-LABEL python.version="3.11" \
-    cuda.version="12.8" \
-    cudnn.version="9" \
-    pytorch.version="2.7.1+cu128" \
-    torchvision.version="0.22.1+cu128"
+# The base image sets and build-time asserts python/cuda/cudnn/pytorch/
+# torchvision versions itself, so they are not duplicated here — a
+# hand-copied label here could only drift from what's actually installed.
+LABEL org.opencontainers.image.description="CBAI/RibSeg downstream image: Pointcept base plus scikit-learn/nibabel/MedPy/jupyter"
 
 # ENV DEBIAN_FRONTEND=noninteractive
 # RUN mkdir -p /data /projects /scratch
 
-# Update pip and install additional packages (base image already has pyyaml, open3d, etc.)
-# Use conda for better version compatibility, pip for packages not in conda
-RUN conda install -y -c conda-forge \
-    scikit-learn scikit-image opencv \
-    simpleitk nibabel medpy itk jupyterlab ipykernel seaborn \
-&& pip install --no-cache-dir \
-    opencv-python-headless \
-&& python -m ipykernel install --name "pointcept" --display-name "Pointcept (docker)" \
-&& ln -s /usr/local/bin/python /usr/local/bin/py \
-&& ln -s /usr/local/bin/pip /usr/local/bin/pi
+# The base image is entirely pip-built, so conda's package metadata no longer
+# describes what's on disk; a conda solve here would be computed against a
+# stale picture, with numpy and libstdc++ the likely casualties. So this is
+# one pinned pip install instead of the old conda + pip split.
+#
+# numpy==1.26.4 here is a constraint only, not a new requirement: it must
+# match the base image exactly, because SharedArray and other C extensions in
+# the base were compiled against these headers, and nothing above should be
+# allowed to drag numpy across the 2.0 boundary.
+#
+# opencv-python-headless only, pinned below 5: the old conda opencv (4.13)
+# and this pip package both provide `cv2` and would overwrite each other in
+# the same site-packages, and an unpinned pip install now resolves to OpenCV
+# 5.x, a major version this code has never run against. Headless is right for
+# GPU nodes with no display.
+#
+# open3d now comes from the base image, which pins the 0.19.0 that
+# tests/test_env.py asserts (it also supplies the libGL/libX11 open3d's wheel
+# needs, so no apt step is required here for it). camtools==0.1.8 is the
+# other half of what tests/test_env.py asserts, and it really is only this
+# fork's dependency, not upstream's — it stays here.
+#
+# MedPy pulls in SimpleITK as a dependency, so it needs no separate entry.
+# Its optional medpy.graphcut C++ extension needs boost and will silently be
+# skipped — its setup.py retries without compilation — which is fine, this
+# project only uses medpy.metric.binary.
+#
+# Dropped from the old conda list because nothing in the repo imports them:
+# itk (~1 GB), standalone simpleitk, scikit-image.
+#
+# No conda clean is needed since no conda command runs any more.
+RUN pip install --no-cache-dir \
+    numpy==1.26.4 \
+    scikit-learn==1.9.0 \
+    nibabel==5.4.2 \
+    MedPy==0.5.2 \
+    seaborn==0.13.2 \
+    opencv-python-headless==4.14.0.94 \
+    camtools==0.1.8 \
+    jupyterlab==4.6.3 \
+    ipykernel==6.31.0
+
+# --sys-prefix lands the kernelspec in the conda prefix
+# (/opt/conda/share/jupyter/kernels), next to the interpreter that owns it,
+# rather than the system path.
+RUN python -m ipykernel install --sys-prefix --name "pointcept" --display-name "Pointcept (docker)"
+
+# The base image has no /usr/local/bin/python — python lives at
+# /opt/conda/bin/python. `ln -s /usr/local/bin/python ...` used to "succeed"
+# while creating a dangling link: `ln -s` never validates its target, and
+# `-f`/`-n` only make the link idempotent and stop it descending into a
+# symlinked directory, neither of which checks the target either. So resolve
+# the real interpreter and verify explicitly: `test -x` follows symlinks and
+# fails on a dangling one, and `py -V` below is the actual proof it works.
+RUN set -eux; \
+    py_bin="$(command -v python)"; pip_bin="$(command -v pip)"; \
+    ln -sfn "$py_bin" /usr/local/bin/py; \
+    ln -sfn "$pip_bin" /usr/local/bin/pi; \
+    [ -x /usr/local/bin/py ]; [ -x /usr/local/bin/pi ]; \
+    py -V; pi --version
+
+# The base image ends with its own strict verification, and the layers above
+# then mutate that same environment; without a check of its own here, a
+# resolver that moved numpy or shadowed a shared library would ship silently.
+# No GPU is present during a build, so this is imports and versions only.
+RUN python <<'PYEOF'
+import json, sys
+
+problems = []
+
+import torch, numpy
+
+with open("/etc/pointcept-image.json") as handle:
+    base_manifest = json.load(handle)
+
+# The base image's own manifest is the contract: these must not have moved.
+if torch.__version__ != base_manifest["torch"]:
+    problems.append(f"torch {torch.__version__} != base manifest {base_manifest['torch']}")
+if torch.version.cuda != base_manifest["cuda"]:
+    problems.append(f"cuda {torch.version.cuda} != base manifest {base_manifest['cuda']}")
+if numpy.__version__ != base_manifest["numpy"]:
+    problems.append(f"numpy {numpy.__version__} != base manifest {base_manifest['numpy']}")
+
+try:
+    import spconv.pytorch
+    import pointops
+    import pointgroup_ops
+    import pointseg
+    import pointrope
+    import flash_attn
+    import torch_scatter
+    import torch_sparse
+    import torch_cluster
+    from pointops2 import pointops as _pointops2
+except Exception as exc:
+    problems.append(f"base extension failed to import: {exc}")
+
+try:
+    import sklearn
+    import nibabel
+    import medpy.metric.binary
+    import seaborn
+    import matplotlib
+    import cv2
+    import open3d
+    import camtools
+    import ipykernel
+except Exception as exc:
+    problems.append(f"added package failed to import: {exc}")
+else:
+    if not cv2.__version__.startswith("4."):
+        problems.append(f"cv2 {cv2.__version__} does not start with 4.")
+
+if problems:
+    print("IMAGE VERIFICATION FAILED", file=sys.stderr)
+    for problem in problems:
+        print("  -", problem, file=sys.stderr)
+    raise SystemExit(1)
+
+print("downstream image OK: base contract held, all added packages import")
+PYEOF

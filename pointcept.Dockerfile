@@ -6,10 +6,13 @@
 # stdin). Pointcept itself is cloned from GitHub at a pinned revision; nothing
 # comes from a local checkout.
 #
-# Scope: Python/PyTorch, the PyG extensions, cumm/spconv, and the five CUDA ops
-# under Pointcept's libs/. Anything beyond upstream — extra datasets, medical
-# imaging, visualisation, jupyter — belongs in a downstream image built FROM
-# this one.
+# Scope: Python/PyTorch, the PyG extensions, cumm/spconv, the five CUDA ops
+# under Pointcept's libs/, and flash-attention — plus open3d, peft and
+# transformers, which are here because upstream's dataset and model registries
+# import them unguarded at module scope (see the dependencies layer below),
+# not as visualisation or NLP extras. Anything beyond upstream — extra
+# datasets, medical imaging, jupyter — belongs in a downstream image built
+# FROM this one.
 #
 # Every native extension is compiled here for a broad architecture range, so the
 # image is portable across mixed GPU fleets and nothing is JIT-compiled at run
@@ -19,6 +22,10 @@
 #   8.6   RTX A4000/A5000/A5500, RTX 3090
 #   8.9   L4, L40, RTX 4090
 #   12.0  RTX PRO 6000 Blackwell
+#
+# flash-attention is a prebuilt wheel and covers only sm_80 and sm_120 (see its
+# install layer below): sm_86/8.9 devices run the sm_80 cubin, but 7.5 hardware
+# has no flash-attention path at all and must run PTv3 with enable_flash=False.
 #
 # Note this deliberately departs from upstream's README, which pins torch 2.5 /
 # CUDA 12.4. CUDA 12.8 is the minimum that supports sm_120 (Blackwell), and
@@ -60,6 +67,10 @@ ARG POINTCEPT_REPOSITORY=https://github.com/Pointcept/Pointcept.git
 ARG POINTCEPT_REVISION=9f37497e4f3005c90bbbe7221b86439c29d60611
 ARG POINTCEPT_VERSION=1.7.0
 
+ARG NUMPY_VERSION=1.26.4
+ARG OPEN3D_VERSION=0.19.0
+ARG TRANSFORMERS_VERSION=4.50.3
+
 ARG PYG_VERSION=2.6.1
 ARG TORCH_SCATTER_VERSION=2.1.2
 ARG TORCH_SPARSE_VERSION=0.6.18
@@ -81,6 +92,11 @@ ARG TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;12.0+PTX"
 ARG CUMM_CUDA_ARCH_LIST="7.5;8.6;8.9;12.0"
 ARG MAX_JOBS=8
 
+# flash-attention's official release wheel, not a source build — see the
+# comment on its install layer below for why this exact tag is the right one.
+ARG FLASH_ATTN_VERSION=2.8.3
+ARG FLASH_ATTN_WHEEL_URL=https://github.com/Dao-AILab/flash-attention/releases/download/v${FLASH_ATTN_VERSION}/flash_attn-${FLASH_ATTN_VERSION}%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+
 LABEL org.opencontainers.image.title="Pointcept base (CUDA 12.8)" \
       org.opencontainers.image.description="Upstream Pointcept with PyG, cumm/spconv and the libs/ CUDA ops prebuilt for sm_75/86/89/120" \
       org.opencontainers.image.source="${POINTCEPT_REPOSITORY}" \
@@ -101,6 +117,10 @@ LABEL org.opencontainers.image.title="Pointcept base (CUDA 12.8)" \
       torch_cluster.version="${TORCH_CLUSTER_VERSION}" \
       cumm.version="${CUMM_VERSION}" \
       spconv.version="${SPCONV_VERSION}" \
+      numpy.version="${NUMPY_VERSION}" \
+      flash_attn.version="${FLASH_ATTN_VERSION}" \
+      open3d.version="${OPEN3D_VERSION}" \
+      transformers.version="${TRANSFORMERS_VERSION}" \
       cuda.arch_list="${TORCH_CUDA_ARCH_LIST}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -115,12 +135,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # --------------------------------------------------------------------------
 # System packages. libsparsehash-dev provides <google/dense_hash_map>, which
 # pointgroup_ops includes; git fetches the pinned revisions.
+#
+# libgl1 and libx11-6 are for open3d: its wheel has hard ELF NEEDED entries on
+# libGL.so.1 and libX11.so.6, which manylinux policy permits wheels to leave
+# unbundled, so the image must supply them or `import open3d` fails. libgomp1
+# is normally already present via build-essential; apt no-ops if so.
 # --------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         git \
+        libgl1 \
+        libgomp1 \
         libsparsehash-dev \
+        libx11-6 \
         ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
@@ -202,24 +230,42 @@ RUN set -eux; \
     rm -rf /opt/pointcept/.git
 
 # --------------------------------------------------------------------------
-# Upstream Pointcept's Python dependencies, per its README plus an import scan
-# of pointcept/ excluding datasets/preprocessing/.
+# Upstream Pointcept's Python dependencies, per its README plus a trace of the
+# eager import chains tools/train.py actually pulls in.
+#
+# open3d, peft and transformers are included here rather than left for a
+# downstream image, because they are not optional: pointcept/datasets/
+# __init__.py eagerly imports semantic_kitti, nuscenes, cap3d, scanobjectnn
+# and partnet, all of which do an unguarded module-scope `import open3d`, and
+# pointcept/models/__init__.py eagerly imports .default (unguarded `from peft
+# import LoraConfig, get_peft_model`), .concerto and .utonia (unguarded `from
+# transformers import ...`). `from pointcept.datasets import build_dataset`
+# and the model registry both run on every tools/train.py invocation, so
+# these three are load-bearing for upstream Pointcept generally, not specific
+# to one model or dataset. transformers is pinned to upstream's README
+# (4.50.3); peft is left unpinned, matching upstream.
 #
 # Left out on purpose, all reachable only from optional code paths:
-#   open3d, opencv, trimesh, pyquaternion, imageio  — datasets/preprocessing/
-#   scikit-learn                                    — utils/eval_cluster.py
-#   MinkowskiEngine, Swin3D                         — alternative backbones
-#   transformers, peft, CLIP                        — PPT models
-#   nuscenes, waymo-open-dataset, tensorflow        — dataset-specific
+#   opencv, trimesh, pyquaternion, imageio      — datasets/preprocessing/
+#   scikit-learn                                — utils/eval_cluster.py
+#   MinkowskiEngine, Swin3D                     — alternative backbones
+#   CLIP                                        — PPT models
+#   ocnn, torchsparse, torch_points3d, dwconv   — guarded, or off the eager path
+#   nuscenes, waymo-open-dataset, tensorflow    — dataset-specific
 # Add whichever a downstream image actually needs.
 # --------------------------------------------------------------------------
-RUN pip install \
+# numpy is installed first, on its own, and pinned: SharedArray is a C
+# extension compiled against the numpy headers present at build time, so the
+# numpy version must be settled before it is built.
+RUN pip install "numpy==${NUMPY_VERSION}" \
+    && pip install \
         addict \
         einops \
         ftfy \
         h5py \
-        numpy \
+        "open3d==${OPEN3D_VERSION}" \
         pandas \
+        peft \
         pillow \
         plyfile \
         pyyaml \
@@ -231,8 +277,42 @@ RUN pip install \
         termcolor \
         timm \
         tqdm \
+        "transformers==${TRANSFORMERS_VERSION}" \
         wandb \
         yapf
+
+# --------------------------------------------------------------------------
+# flash-attention, installed from the official prebuilt release wheel rather
+# than built from source. Every part of the wheel tag was checked against this
+# image: cp311, torch2.7, and cxx11abiTRUE (torch 2.7.1 reports
+# _GLIBCXX_USE_CXX11_ABI = True). flash-attention's release workflow builds
+# these wheels against torch 2.7.1+cu128 — the same torch this image carries.
+#
+# --no-deps because the wheel declares torch and einops as dependencies, both
+# already present; letting pip resolve them risks pulling in a different torch
+# over the one everything else here was compiled against.
+#
+# Architectures are baked into the wheel and are NOT governed by
+# TORCH_CUDA_ARCH_LIST: the release build leaves FLASH_ATTN_CUDA_ARCHS at its
+# default of 80;90;100;120 and compiles with CUDA 12.9, so the wheel carries
+# sm_80, sm_90, sm_100 and sm_120.
+#
+# sm_75 is absent and cannot be obtained at any flash-attention version —
+# FlashAttention-2 is Ampere-and-newer. The Turing machines in this fleet
+# (Quadro RTX 6000, RTX 2080 Ti, T4) must run PTv3 with enable_flash=False.
+#
+# sm_86 and sm_89 are covered by the sm_80 cubin: CUDA cubins are
+# forward-compatible across minor compute-capability revisions within the same
+# major version.
+#
+# To build from source instead (e.g. for a different torch), the equivalent is
+# FLASH_ATTN_CUDA_ARCHS="80;120" pip install --no-build-isolation
+# "flash-attn==${FLASH_ATTN_VERSION}", which costs 1-2 hours. The prebuilt
+# wheel used here is ~256 MB to download but unpacks to a single
+# flash_attn_2_cuda*.so of ~1 GB — the cost of carrying four architectures'
+# worth of prebuilt kernels in one file.
+# --------------------------------------------------------------------------
+RUN pip install --no-deps "${FLASH_ATTN_WHEEL_URL}"
 
 # --------------------------------------------------------------------------
 # Verify. Fails the build if the labels disagree with reality, if a native
@@ -244,16 +324,16 @@ RUN pip install \
 # No GPU is present during a build, so this checks loading, ABI and compiled
 # SASS, never kernel execution.
 # --------------------------------------------------------------------------
-ENV POINTCEPT_EXPECT="${PYTHON_VERSION},${TORCH_VERSION},${TORCHVISION_VERSION},${CUDA_VERSION},${CUDNN_MAJOR},${POINTCEPT_REVISION}"
+ENV POINTCEPT_EXPECT="${PYTHON_VERSION},${TORCH_VERSION},${TORCHVISION_VERSION},${CUDA_VERSION},${CUDNN_MAJOR},${POINTCEPT_REVISION},${NUMPY_VERSION},${FLASH_ATTN_VERSION},${OPEN3D_VERSION},${TRANSFORMERS_VERSION}"
 
 RUN python <<'PYEOF'
 import glob, json, os, re, subprocess, sys
 
-py_v, torch_v, tv_v, cuda_v, cudnn_major, pointcept_rev = \
-    os.environ["POINTCEPT_EXPECT"].split(",")
+(py_v, torch_v, tv_v, cuda_v, cudnn_major, pointcept_rev, numpy_v, flash_v,
+ open3d_v, transformers_v) = os.environ["POINTCEPT_EXPECT"].split(",")
 problems = []
 
-import torch, torchvision
+import torch, torchvision, numpy, open3d, peft, transformers
 
 actual_py = f"{sys.version_info.major}.{sys.version_info.minor}"
 if actual_py != py_v:
@@ -262,6 +342,15 @@ if not torch.__version__.startswith(torch_v):
     problems.append(f"torch {torch.__version__} != labelled {torch_v}")
 if not torchvision.__version__.startswith(tv_v):
     problems.append(f"torchvision {torchvision.__version__} != labelled {tv_v}")
+if numpy.__version__ != numpy_v:
+    problems.append(f"numpy {numpy.__version__} != labelled {numpy_v}")
+if open3d.__version__ != open3d_v:
+    problems.append(f"open3d {open3d.__version__} != labelled {open3d_v}")
+if transformers.__version__ != transformers_v:
+    problems.append(f"transformers {transformers.__version__} != labelled {transformers_v}")
+# peft is deliberately unpinned, matching upstream's README, so only its
+# presence is checked (via the import above); its version is still recorded
+# in the manifest below.
 if torch.version.cuda != cuda_v:
     problems.append(f"cuda {torch.version.cuda} != labelled {cuda_v}")
 cudnn = torch.backends.cudnn.version()
@@ -272,6 +361,7 @@ if cudnn is None or cudnn // 10000 != int(cudnn_major):
 import torch_cluster, torch_geometric, torch_scatter, torch_sparse
 import cumm, spconv, spconv.pytorch
 import pointgroup_ops, pointops, pointrope, pointseg
+import flash_attn
 from pointops2 import pointops as _pointops2
 
 for mod, want in (
@@ -280,10 +370,19 @@ for mod, want in (
     if mod.__version__ != want:
         problems.append(
             f"{mod.__name__} {mod.__version__} != {want} (a wheel, not our build?)")
+if not flash_attn.__version__.startswith(flash_v):
+    problems.append(f"flash_attn {flash_attn.__version__} != labelled {flash_v}")
 
 # Pointcept itself must import from the tree the ops were built from.
+# pointcept/__init__.py is 0 bytes upstream, so a bare `import pointcept`
+# touches no dependency and proves nothing. pointcept.datasets and
+# pointcept.models are what any tools/train.py run actually pulls in — via
+# `from pointcept.datasets import build_dataset` and the model registry — so
+# importing them here is what catches a missing upstream dependency at build
+# time instead of at the start of someone's training job.
 sys.path.insert(0, "/opt/pointcept")
-import pointcept  # noqa: F401
+import pointcept.datasets
+import pointcept.models
 
 # spconv records the architectures it was compiled for.
 from spconv.cppconstants import COMPILED_CUDA_ARCHS
@@ -299,6 +398,20 @@ spconv_archs = {f"sm_{a}{b}" for a, b in COMPILED_CUDA_ARCHS}
 missing = targets - spconv_archs
 if missing:
     problems.append(f"spconv missing archs {sorted(missing)}; has {sorted(spconv_archs)}")
+
+def _sass_archs(so):
+    # Runs cuobjdump over a single .so and returns the sm_XX architectures its
+    # compiled device code covers, or None if cuobjdump failed or the object
+    # carries no device code at all (a host-only object). Shared by the
+    # per-op loop below and the flash-attn check that follows it.
+    try:
+        out = subprocess.run(["cuobjdump", "--list-elf", so],
+                             capture_output=True, text=True, timeout=120).stdout
+    except Exception:
+        return None
+    found = {f"sm_{a}" for a in re.findall(r"sm_(\d+)", out)}
+    return found or None
+
 
 # Read the compiled SASS out of each CUDA op and confirm nothing is absent.
 # pointseg is a CppExtension and carries no device code, so it drops out here.
@@ -323,17 +436,26 @@ for package in ("pointops", "pointops2", "pointgroup_ops", "pointrope",
         if so in seen:
             continue
         seen.add(so)
-        try:
-            out = subprocess.run(["cuobjdump", "--list-elf", so],
-                                 capture_output=True, text=True, timeout=120).stdout
-        except Exception:
-            continue
-        found = {f"sm_{a}" for a in re.findall(r"sm_(\d+)", out)}
-        if not found:
+        found = _sass_archs(so)
+        if found is None:
             continue          # host-only object
         gap = targets - found
         if gap:
             problems.append(f"{os.path.relpath(so, site)} missing {sorted(gap)}")
+
+# flash-attn's architectures come from the prebuilt wheel, not from
+# TORCH_CUDA_ARCH_LIST, so it is checked against its own fixed expectation.
+# sm_86/sm_89 devices run the sm_80 cubin; sm_75 has no FlashAttention-2
+# support at all, which is why the Turing machines need enable_flash=False.
+flash_expected = {"sm_80", "sm_120"}
+flash_so = glob.glob(f"{site}/flash_attn_2_cuda*.so")
+if not flash_so:
+    problems.append("flash_attn_2_cuda*.so not found")
+for so in flash_so:
+    found = _sass_archs(os.path.realpath(so)) or set()
+    gap = flash_expected - found
+    if gap:
+        problems.append(f"{os.path.relpath(so, site)} missing {sorted(gap)}")
 
 
 def _nccl_version():
@@ -364,6 +486,11 @@ manifest = {
     "torch_cluster": torch_cluster.__version__,
     "cumm": cumm.__version__,
     "spconv": spconv.__version__,
+    "numpy": numpy.__version__,
+    "flash_attn": flash_attn.__version__,
+    "open3d": open3d.__version__,
+    "transformers": transformers.__version__,
+    "peft": peft.__version__,
     "cuda_arch_list": os.environ["TORCH_CUDA_ARCH_LIST"],
     "compiled_archs": sorted(spconv_archs),
     "pointcept_ops": ["pointops", "pointops2", "pointgroup_ops", "pointseg",
