@@ -5,7 +5,7 @@ FROM tyloeng/pointcept:py3.11-torch2.7.1-cu12.8-cudnn9
 # The base image sets and build-time asserts python/cuda/cudnn/pytorch/
 # torchvision versions itself, so they are not duplicated here — a
 # hand-copied label here could only drift from what's actually installed.
-LABEL org.opencontainers.image.description="CBAI/RibSeg downstream image: Pointcept base plus scikit-learn/nibabel/MedPy/jupyter"
+LABEL org.opencontainers.image.description="Pointcept base plus nibabel/MedPy/jupyter"
 
 # ENV DEBIAN_FRONTEND=noninteractive
 # RUN mkdir -p /data /projects /scratch
@@ -18,7 +18,14 @@ LABEL org.opencontainers.image.description="CBAI/RibSeg downstream image: Pointc
 # numpy==1.26.4 here is a constraint only, not a new requirement: it must
 # match the base image exactly, because SharedArray and other C extensions in
 # the base were compiled against these headers, and nothing above should be
-# allowed to drag numpy across the 2.0 boundary.
+# allowed to drag numpy across the 2.0 boundary. PIP_CONSTRAINT, inherited
+# from the base image's ENV, now enforces this same value image-wide, so this
+# line is belt-and-braces against exactly the drift that already bit one
+# build once.
+#
+# scikit-learn is not listed here: it now arrives with open3d from the base
+# image (open3d 0.19.0 depends on it). If it ever needs a version floor, the
+# place to pin it is the base image, not here.
 #
 # opencv-python-headless only, pinned below 5: the old conda opencv (4.13)
 # and this pip package both provide `cv2` and would overwrite each other in
@@ -37,13 +44,16 @@ LABEL org.opencontainers.image.description="CBAI/RibSeg downstream image: Pointc
 # skipped — its setup.py retries without compilation — which is fine, this
 # project only uses medpy.metric.binary.
 #
+# ipykernel==6.31.0 is not redundant with jupyterlab: jupyterlab 4.6.3
+# requires ipykernel!=6.30.0,>=6.5.0 with no upper bound, so without this pin
+# it would pull ipykernel 7.x, a major rewrite.
+#
 # Dropped from the old conda list because nothing in the repo imports them:
 # itk (~1 GB), standalone simpleitk, scikit-image.
 #
 # No conda clean is needed since no conda command runs any more.
 RUN pip install --no-cache-dir \
     numpy==1.26.4 \
-    scikit-learn==1.9.0 \
     nibabel==5.4.2 \
     MedPy==0.5.2 \
     seaborn==0.13.2 \

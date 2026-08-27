@@ -133,6 +133,30 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda
 
 # --------------------------------------------------------------------------
+# Image-wide pip constraint on numpy. Every `pip install` from here on in this
+# image — and in any image built FROM it, since PIP_CONSTRAINT is an
+# environment variable and is inherited — is constrained by this file. That
+# includes an ad-hoc `pip install` a user runs inside a running container.
+#
+# numpy is the one version in this image that other packages can silently
+# move. A build where the dependency layer below resolved a newer numpy than
+# the one pinned shipped an ABI mismatch against SharedArray, which is
+# compiled against numpy's headers. Pinning numpy in a single `pip install`
+# only protects that one command; the constraint file protects all of them.
+#
+# Nothing on the py3.11 dependency graph actually *declares* numpy>=2: open3d
+# wants numpy>=1.18, transformers numpy>=1.17, matplotlib numpy>=1.25,
+# scikit-learn numpy>=1.24.1, pandas numpy>=1.26.0. The drift came from pip's
+# resolver preferring a newer version for a transitive dependency nothing
+# pinned, which is exactly what a constraint file is for.
+#
+# The file is written before PIP_CONSTRAINT is set because pip errors if the
+# constraint path does not exist.
+# --------------------------------------------------------------------------
+RUN printf 'numpy==%s\n' "${NUMPY_VERSION}" > /etc/pip-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
+
+# --------------------------------------------------------------------------
 # System packages. libsparsehash-dev provides <google/dense_hash_map>, which
 # pointgroup_ops includes; git fetches the pinned revisions.
 #
@@ -245,18 +269,31 @@ RUN set -eux; \
 # to one model or dataset. transformers is pinned to upstream's README
 # (4.50.3); peft is left unpinned, matching upstream.
 #
+# open3d 0.19.0 also declares its own dependencies: dash, werkzeug, flask,
+# nbformat, configargparse, ipywidgets, addict, pillow, matplotlib, pandas,
+# pyyaml, scikit-learn, tqdm, pyquaternion. So scikit-learn and pyquaternion
+# below are not left out — they arrive as open3d dependencies rather than as
+# deliberate additions. open3d also brings matplotlib and a
+# dash/flask/werkzeug/ipywidgets web stack that nothing here uses; this is
+# unavoidable without --no-deps, which would risk breaking `import open3d`.
+#
 # Left out on purpose, all reachable only from optional code paths:
-#   opencv, trimesh, pyquaternion, imageio      — datasets/preprocessing/
-#   scikit-learn                                — utils/eval_cluster.py
+#   opencv, trimesh, imageio                    — datasets/preprocessing/
 #   MinkowskiEngine, Swin3D                     — alternative backbones
 #   CLIP                                        — PPT models
 #   ocnn, torchsparse, torch_points3d, dwconv   — guarded, or off the eager path
 #   nuscenes, waymo-open-dataset, tensorflow    — dataset-specific
 # Add whichever a downstream image actually needs.
+#
+# addict, pillow, pandas, pyyaml and tqdm appear both in the explicit list
+# below and in open3d's dependencies, and stay explicit deliberately: they are
+# upstream Pointcept requirements in their own right and must not silently
+# depend on open3d continuing to pull them.
 # --------------------------------------------------------------------------
 # numpy is installed first, on its own, and pinned: SharedArray is a C
 # extension compiled against the numpy headers present at build time, so the
-# numpy version must be settled before it is built.
+# numpy version must be settled before it is built. The version itself is now
+# also enforced image-wide by the PIP_CONSTRAINT set above.
 RUN pip install "numpy==${NUMPY_VERSION}" \
     && pip install \
         addict \
@@ -327,7 +364,7 @@ RUN pip install --no-deps "${FLASH_ATTN_WHEEL_URL}"
 ENV POINTCEPT_EXPECT="${PYTHON_VERSION},${TORCH_VERSION},${TORCHVISION_VERSION},${CUDA_VERSION},${CUDNN_MAJOR},${POINTCEPT_REVISION},${NUMPY_VERSION},${FLASH_ATTN_VERSION},${OPEN3D_VERSION},${TRANSFORMERS_VERSION}"
 
 RUN python <<'PYEOF'
-import glob, json, os, re, subprocess, sys
+import glob, importlib.metadata, json, os, re, subprocess, sys
 
 (py_v, torch_v, tv_v, cuda_v, cudnn_major, pointcept_rev, numpy_v, flash_v,
  open3d_v, transformers_v) = os.environ["POINTCEPT_EXPECT"].split(",")
@@ -363,6 +400,15 @@ import cumm, spconv, spconv.pytorch
 import pointgroup_ops, pointops, pointrope, pointseg
 import flash_attn
 from pointops2 import pointops as _pointops2
+# SharedArray matters more here than it looks: it is the reason numpy is
+# pinned at all, yet its only consumer — pointcept/utils/cache.py — wraps the
+# import in try: import SharedArray / except ImportError: SharedArray = None.
+# A numpy ABI break raises ImportError there, so it is swallowed silently and
+# only surfaces much later, mid-run, as
+# AttributeError: 'NoneType' object has no attribute 'attach' from
+# shared_array(). Importing it here is the only place that failure is visible
+# at build time.
+import SharedArray
 
 for mod, want in (
     (torch_scatter, "2.1.2"), (torch_sparse, "0.6.18"), (torch_cluster, "1.6.3"),
@@ -487,6 +533,7 @@ manifest = {
     "cumm": cumm.__version__,
     "spconv": spconv.__version__,
     "numpy": numpy.__version__,
+    "sharedarray": importlib.metadata.version("sharedarray"),
     "flash_attn": flash_attn.__version__,
     "open3d": open3d.__version__,
     "transformers": transformers.__version__,
