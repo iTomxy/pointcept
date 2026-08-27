@@ -303,9 +303,10 @@ Full report: `plans/hardware-info/hwinfo-saturn2-gpu.md`
 GPU in use is now four architectures — and the earlier proposal of
 `8.6;8.9;12.0+PTX` was **wrong**: cetus's 24‑cpu exec class (`hpc-exec01`‑`04`)
 carries **Quadro RTX 6000, `sm_7.5`**, so `7.5` *is* needed and must stay. The
-current [env.sh](../env.sh) default (`7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX`) only
-needs `8.0`, `9.0` and `10.0` dropped — those three genuinely run nowhere in this
-fleet (cbai 8.6; iHPC 8.6/8.9; cetus 7.5/12.0). `12.0+PTX` keeps forward
+conda-era default (`7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX`) only needed `8.0`, `9.0`
+and `10.0` dropped — those three genuinely run nowhere in this fleet (cbai 8.6;
+iHPC 8.6/8.9; cetus 7.5/12.0), and the list now lives in
+[pointcept.Dockerfile](../pointcept.Dockerfile). `12.0+PTX` keeps forward
 compatibility for future hardware via PTX JIT.
 
 > **Caveat — cetus desk class not yet collected.** `hpc-desk01`‑`07` (1 GPU each,
@@ -412,9 +413,9 @@ Ampere (`sm_80`). FlashAttention also requires `sm_80`+. So on `small_gpuq` and
 `med_gpuq`, the only queues that allow 24-48 h runs:
 
 - a `bf16` mixed-precision config will fail or silently fall back;
-- FlashAttention is unavailable — consistent with [env.sh](../env.sh) already
-  disabling it for the RibSeg PTv3 config, and with `pointcept.def` not
-  installing it.
+- FlashAttention is unavailable — consistent with the RibSeg PTv3 config
+  already disabling it, and with [pointcept.Dockerfile](../pointcept.Dockerfile)
+  not installing it.
 
 Use `fp16` AMP or fp32 for anything that must run there, and keep `bf16` for the
 Blackwell nodes. This is a config concern, not an image concern, but it is
