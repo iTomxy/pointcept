@@ -2,9 +2,10 @@
 # Base Pointcept image — upstream Pointcept and its dependencies only.
 #
 # Standalone: the build context is never read, so this file can be published and
-# built anywhere with `docker build -f pointcept.Dockerfile .` (or piped in on
-# stdin). Pointcept itself is cloned from GitHub at a pinned revision; nothing
-# comes from a local checkout.
+# built anywhere with
+# `docker build -f containers/pointcept-cu128_pt271.Dockerfile .` (or piped in
+# on stdin). Pointcept itself is cloned from GitHub at a pinned revision;
+# nothing comes from a local checkout.
 #
 # Scope: Python/PyTorch, the PyG extensions, cumm/spconv, the five CUDA ops
 # under Pointcept's libs/, and flash-attention — plus open3d, peft and
@@ -32,10 +33,11 @@
 # 12.8 rather than a later release because some drivers cap there.
 #
 # Build:
-#   DOCKER_BUILDKIT=1 docker build -f pointcept.Dockerfile -t pointcept-base:cu128 .
+#   DOCKER_BUILDKIT=1 docker build -f containers/pointcept-cu128_pt271.Dockerfile \
+#       -t pointcept-base:cu128 .
 #
 # Trim to one architecture for faster iteration:
-#   DOCKER_BUILDKIT=1 docker build -f pointcept.Dockerfile \
+#   DOCKER_BUILDKIT=1 docker build -f containers/pointcept-cu128_pt271.Dockerfile \
 #       --build-arg TORCH_CUDA_ARCH_LIST="12.0+PTX" \
 #       --build-arg CUMM_CUDA_ARCH_LIST="12.0" \
 #       --build-arg MAX_JOBS=16 -t pointcept-base:cu128-blackwell .

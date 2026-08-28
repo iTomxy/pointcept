@@ -70,7 +70,7 @@ The root log path can be placed under it directly.
 Agents should use one of them to manage long tasks,
 e.g. experiments and data processing,
 instead of directly executing in foreground to avoid getting stuck.
-- Env: use the container image defined by [Dockerfile](../Dockerfile) or [pointcept.def](../pointcept.def),
+- Env: use the container image defined by [cu128_pt271.Dockerfile](../containers/cu128_pt271.Dockerfile) or [pointcept-cu128_pt271.def](../containers/pointcept-cu128_pt271.def),
 not conda env.
 - For any helper scripts (python and bash),
 agents should follow the file name patterns: `tmp-ai*.sh` and `tmp-ai*.py`,

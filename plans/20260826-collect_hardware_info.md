@@ -372,7 +372,7 @@ carries **Quadro RTX 6000, `sm_7.5`**, so `7.5` *is* needed and must stay. The
 conda-era default (`7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX`) only needed `8.0`, `9.0`
 and `10.0` dropped — those three genuinely run nowhere in this fleet (cbai 8.6;
 iHPC 7.0/8.6/8.9; cetus 7.5/12.0), and the list now lives in
-[pointcept.Dockerfile](../pointcept.Dockerfile). `12.0+PTX` keeps forward
+[pointcept-cu128_pt271.Dockerfile](../containers/pointcept-cu128_pt271.Dockerfile). `12.0+PTX` keeps forward
 compatibility for future hardware via PTX JIT.
 
 > **Caveat — saturn14 (V100, `sm_70`) is out of scope for this image, not
@@ -427,8 +427,9 @@ apptainer build pointcept.sif docker://<account>/pointcept:cu128
 That avoids copying a 10-20 GB `.sif` between clusters. All three clusters can also build natively — cetus via apptainer, iHPC GPU
 nodes via `singularity_build` (both verified), cbai via `docker build` — so
 per-cluster builds remain a fallback. The cost is keeping the recipe in sync
-across two files, as [Dockerfile](../Dockerfile) and
-[pointcept.def](../pointcept.def) are today; the registry route keeps one.
+across two files, as [cu128_pt271.Dockerfile](../containers/cu128_pt271.Dockerfile) and
+[pointcept-cu128_pt271.def](../containers/pointcept-cu128_pt271.def)
+are today; the registry route keeps one.
 
 ## Image placement
 
@@ -501,7 +502,7 @@ Ampere (`sm_80`). FlashAttention also requires `sm_80`+. So on `small_gpuq` and
 `med_gpuq`, the only queues that allow 24-48 h runs:
 
 - a `bf16` mixed-precision config will fail or silently fall back;
-- FlashAttention is unavailable — [pointcept.Dockerfile](../pointcept.Dockerfile)
+- FlashAttention is unavailable — [pointcept-cu128_pt271.Dockerfile](../containers/pointcept-cu128_pt271.Dockerfile)
   does install flash-attention 2.8.3, and its prebuilt wheel actually carries
   `sm_80`, `sm_90`, `sm_100` and `sm_120` cubins; of those, only `sm_80`
   matters for this fleet (nothing here is Hopper or datacenter Blackwell), with
