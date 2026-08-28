@@ -8,7 +8,7 @@ From: tyloeng/pointcept:py3.11-torch2.7.1-cu12.8-cudnn9
 %labels
 
 Base tyloeng/pointcept:py3.11-torch2.7.1-cu12.8-cudnn9
-Adds nibabel,MedPy,seaborn,opencv-python-headless,camtools,jupyterlab,ipykernel
+Adds nibabel,MedPy,seaborn,opencv-python,camtools,jupyterlab,ipykernel
 
 %environment
 
@@ -29,6 +29,12 @@ set -eux
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /data /projects /scratch
 
+# libglib2.0-0 provides libgthread-2.0.so.0, which the non-headless
+# opencv-python links against. libgl1 and libx11-6 are already present from
+# the base image, where open3d needs them.
+apt-get update && apt-get install -y --no-install-recommends libglib2.0-0
+rm -rf /var/lib/apt/lists/*
+
 # The base image is entirely pip-built, so conda's package metadata no longer
 # describes what's on disk; a conda solve here would be computed against a
 # stale picture, with numpy and libstdc++ the likely casualties. So this is
@@ -46,11 +52,22 @@ mkdir -p /data /projects /scratch
 # image (open3d 0.19.0 depends on it). If it ever needs a version floor, the
 # place to pin it is the base image, not here.
 #
-# opencv-python-headless only, pinned below 5: the old conda opencv (4.13)
-# and this pip package both provide `cv2` and would overwrite each other in
-# the same site-packages, and an unpinned pip install now resolves to OpenCV
-# 5.x, a major version this code has never run against. Headless is right for
-# GPU nodes with no display.
+# Exactly one opencv distribution is installed, deliberately. camtools
+# depends on opencv-python>=4.5.1.48, so pinning opencv-python-headless
+# alongside it put two packages that each ship a top-level cv2/ directory
+# into the same site-packages, where they overwrite each other file by file.
+#
+# 4.11.0.86 is the newest release compatible with the base image's
+# numpy==1.26.4; from 4.12 onward opencv requires numpy>=2, which the
+# inherited PIP_CONSTRAINT refuses. That is a hard resolver conflict, not a
+# silent downgrade, so an unpinned or too-new opencv fails the build outright.
+#
+# The headless variant is not needed here: the base already ships
+# libgl1/libx11-6 for open3d, so nothing is gained by avoiding GL.
+#
+# Nothing in this project imports cv2 directly — it is only present as a
+# camtools dependency (the repo's only cv2 uses are under
+# pointcept/datasets/preprocessing/, which this fork does not run).
 #
 # open3d now comes from the base image, which pins the 0.19.0 that
 # tests/test_env.py asserts (it also supplies the libGL/libX11 open3d's wheel
@@ -67,8 +84,10 @@ mkdir -p /data /projects /scratch
 # requires ipykernel!=6.30.0,>=6.5.0 with no upper bound, so without this pin
 # it would pull ipykernel 7.x, a major rewrite.
 #
-# Dropped from the old conda list because nothing in the repo imports them:
-# itk (~1 GB), standalone simpleitk, scikit-image.
+# itk (~1 GB) and standalone simpleitk are dropped from the old conda list;
+# nothing in the repo imports either. scikit-image is no longer requested
+# explicitly here, but it is not gone: camtools depends on
+# scikit-image>=0.16.2, so it arrives transitively.
 #
 # No conda clean is needed since no conda command runs any more.
 # The Docker downstream inherits PIP_CONSTRAINT from the base image's ENV
@@ -80,7 +99,7 @@ pip install --no-cache-dir \
     nibabel==5.4.2 \
     MedPy==0.5.2 \
     seaborn==0.13.2 \
-    opencv-python-headless==4.14.0.94 \
+    opencv-python==4.11.0.86 \
     camtools==0.1.8 \
     jupyterlab==4.6.3 \
     ipykernel==6.31.0
@@ -163,6 +182,18 @@ except Exception as exc:
 else:
     if not cv2.__version__.startswith("4."):
         problems.append(f"cv2 {cv2.__version__} does not start with 4.")
+
+    # Two opencv distributions in one site-packages overwrite each other's
+    # cv2/ directory, and cv2.__version__ alone cannot tell you it happened.
+    # camtools depends on opencv-python, so this is a live hazard, not a
+    # theoretical one.
+    import importlib.metadata as _md
+    _cv = sorted(
+        name for d in _md.distributions()
+        if (name := (d.metadata["Name"] or "")).lower().startswith("opencv")
+    )
+    if len(_cv) > 1:
+        problems.append(f"multiple opencv distributions installed: {_cv}")
 
 if problems:
     print("IMAGE VERIFICATION FAILED", file=sys.stderr)
