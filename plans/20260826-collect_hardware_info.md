@@ -284,6 +284,58 @@ Full report: `plans/hardware-info/hwinfo-saturn2-gpu.md`
 > - L40 has 46 GiB VRAM (2x L4) — better for large batch sizes.
 > - No scheduler means jobs run interactively — no walltime caps.
 
+### mars3 (GPU node — collected 2026-08-28)
+
+Full report: `plans/hardware-info/hwinfo-mars3-gpu.md`
+
+| item | value |
+|---|---|
+| OS / glibc | RHEL 8.10, glibc 2.28 |
+| CPU / RAM | AMD EPYC 9354P, 32c/32t, 188 GiB |
+| GPU | 2 × NVIDIA L4, `sm_89` (8.9), 23 GiB each, driver **570.144** (CUDA ≤ 12.8) |
+| GPU topology | GPU0 ↔ GPU1 via SYS (PCIe + SMP); NUMA 0 / 1 split (GPU0: NUMA 1, GPU1: NUMA 0) |
+| apptainer | absent |
+| singularity | 4.2.2 — **userns build capable: yes**, `--nv` passthrough: **ok** |
+| docker | absent |
+| podman | 4.9.4-rhel |
+| storage | `/home` 48G free (NFS), `/tmp` 254G (local NVMe), `/scratch` 1.1T (local NVMe), `/data` 4.7P (NFS), `/share` 27G (NFS, 99% full) |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly) |
+| host CUDA | no nvcc, module system available |
+
+> **Note:** mars3 is hardware-identical to mars4 (same 2× L4, `sm_89`, same
+> driver/storage). Nothing new for the image recipe; recorded for completeness
+> because mars3 is the node currently running the PointNeXt-XL 2-stage run.
+
+### saturn14 (GPU node — collected 2026-08-28)
+
+Full report: `plans/hardware-info/hwinfo-saturn14-gpu.md`
+
+| item | value |
+|---|---|
+| OS / glibc | RHEL 8.10, glibc 2.28 |
+| CPU / RAM | Intel Xeon Gold 6126, 24 logical cpus, 187 GiB |
+| GPU | 2 × **Tesla V100-PCIE-32GB**, `sm_70` (**7.0**), **32 GiB each**, driver **570.144** (CUDA ≤ 12.8) |
+| GPU topology | GPU0 ↔ GPU1 via SYS (PCIe + SMP); NUMA 0 / 1 split |
+| apptainer | absent |
+| singularity | 4.2.2 — **userns build capable: yes**, `--nv` passthrough: **ok** |
+| docker | absent |
+| podman | 4.9.4-rhel |
+| storage | `/home` 48G free (NFS), `/tmp` 254G (local NVMe), `/var` 16G, `/scratch` 1.9T (local NVMe), `/data` 4.7P (NFS), `/share` 27G (NFS, 99% full) |
+| egress | Docker Hub (401), PyPI (200), GitHub (200), data.pyg.org (200) — all reachable |
+| scheduler | **none** (run jobs directly) |
+| host CUDA | no nvcc, module system available |
+
+> **Note — saturn14 is a FIFTH architecture (`sm_70`, Volta V100) not in the
+> current arch list `7.5;8.6;8.9;12.0+PTX`.** This is exactly why the prebuilt
+> `cu118_pt271` openpoints extensions (compiled for `sm_89`) fail there with
+> *"no kernel image is available for execution on the device"* (see
+> `error-openpoints-env.md` in the pointnext-lightning repo). To make saturn14 a
+> training target — and to keep the conda env loadable there — `7.0` (or
+> `7.0+PTX`) must be added to `TORCH_CUDA_ARCH_LIST`. Driver 570.144 ≥ 570, so
+> saturn14 otherwise meets every other gate (CUDA ≤ 12.8, singularity `--nv` ok,
+> ample `/tmp`/`/scratch` for an image build).
+
 # Synthesis — what the image must be
 
 ## GPU matrix
@@ -295,19 +347,31 @@ Full report: `plans/hardware-info/hwinfo-saturn2-gpu.md`
 | cbai | `strax-server2` | RTX A4000 | **8.6** | 16 GiB | 4 | 580.95.05 | 13.0 |
 | iHPC | `venus7`, `venus11` | RTX A5500 | **8.6** | 24 GiB | 2 | 570.144 | **12.8** |
 | iHPC | `mars4` | L4 | **8.9** | 23 GiB | 2 | 570.144 | **12.8** |
+| iHPC | `mars3` | L4 | **8.9** | 23 GiB | 2 | 570.144 | **12.8** |
 | iHPC | `saturn2` | L40 | **8.9** | 46 GiB | 2 | 570.144 | **12.8** |
+| iHPC | `saturn14` | V100 | **7.0** | 32 GiB | 2 | 570.144 | **12.8** |
 
 ## Decisions this settles
 
 **Arch list: `TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;12.0+PTX"`.** The union of every
-GPU in use is now four architectures — and the earlier proposal of
+GPU in use is now five architectures — and the earlier proposal of
 `8.6;8.9;12.0+PTX` was **wrong**: cetus's 24‑cpu exec class (`hpc-exec01`‑`04`)
 carries **Quadro RTX 6000, `sm_7.5`**, so `7.5` *is* needed and must stay. The
 conda-era default (`7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX`) only needed `8.0`, `9.0`
 and `10.0` dropped — those three genuinely run nowhere in this fleet (cbai 8.6;
-iHPC 8.6/8.9; cetus 7.5/12.0), and the list now lives in
+iHPC 7.0/8.6/8.9; cetus 7.5/12.0), and the list now lives in
 [pointcept.Dockerfile](../pointcept.Dockerfile). `12.0+PTX` keeps forward
 compatibility for future hardware via PTX JIT.
+
+> **Caveat — saturn14 (V100, `sm_70`) not yet in the list.** The GPU matrix above
+> now includes `saturn14` as a fifth architecture, but `7.0` is **absent** from
+> `TORCH_CUDA_ARCH_LIST`. Two consequences: (1) the planned cu128 image will not
+> run on saturn14 — exactly the failure seen with the prebuilt `cu118_pt271`
+> openpoints extensions, which were compiled for `sm_89` (see
+> `error-openpoints-env.md` in the pointnext-lightning repo); and (2) to make
+> saturn14 a training target the list must become `7.0;7.5;8.6;8.9;12.0+PTX`
+> (or `7.0+PTX` for forward JIT). This is a *new* requirement discovered on
+> 2026-08-28; the four-architecture list remains correct for every other node.
 
 > **Caveat — cetus desk class not yet collected.** `hpc-desk01`‑`07` (1 GPU each,
 > in `iworkq`, currently **offline**) may carry a *fourth* architecture. If any
@@ -462,7 +526,8 @@ One residual sampling caveat, low risk: `hpc-exec03` stands for the whole
 each class uniform in cpu and memory, so this is a reasonable inference, but a
 job landing on an unsampled node with a different card would be outside the
 measured set. The `7.5;8.6;8.9;12.0+PTX` list covers every architecture seen on
-any cluster, which makes that largely academic.
+any cluster **except saturn14's V100 (`sm_70`)** — see the caveat under
+"Decisions this settles"; add `7.0` before relying on saturn14.
 
 # collect-hwinfo.sh
 
