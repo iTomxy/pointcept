@@ -326,15 +326,27 @@ Full report: `plans/hardware-info/hwinfo-saturn14-gpu.md`
 | scheduler | **none** (run jobs directly) |
 | host CUDA | no nvcc, module system available |
 
-> **Note — saturn14 is a FIFTH architecture (`sm_70`, Volta V100) not in the
-> current arch list `7.5;8.6;8.9;12.0+PTX`.** This is exactly why the prebuilt
-> `cu118_pt271` openpoints extensions (compiled for `sm_89`) fail there with
-> *"no kernel image is available for execution on the device"* (see
-> `error-openpoints-env.md` in the pointnext-lightning repo). To make saturn14 a
-> training target — and to keep the conda env loadable there — `7.0` (or
-> `7.0+PTX`) must be added to `TORCH_CUDA_ARCH_LIST`. Driver 570.144 ≥ 570, so
+> **Note — saturn14 is a FIFTH architecture (`sm_70`, Volta V100), and no
+> `TORCH_CUDA_ARCH_LIST` edit brings it into reach.** PyTorch's own build script
+> drops Volta from its CUDA 12.8 wheels: `pytorch` tag `v2.7.1`,
+> `.ci/manywheel/build_cuda.sh` lines 54-62, sets
+> `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;9.0;10.0;12.0+PTX"` for `CUDA_VERSION=12.8`,
+> with the comment *"removing sm_50-sm_70 as these architectures are deprecated
+> in CUDA 12.8 and will be removed in future releases"*. torch 2.7.1+cu128 ships
+> no `sm_70` kernels for any `torch.*` op — conv, matmul, elementwise — so adding
+> `7.0` to compile Pointcept's own extensions (spconv/cumm, the PyG ops, the five
+> Pointcept CUDA ops) would not help: torch's own kernels would still be absent
+> on saturn14, reproducing the identical *"no kernel image is available for
+> execution on the device"*. There is no JIT escape either — the only PTX in
+> this build is `12.0+PTX`, and PTX is forward-compatible only, never down to
+> `sm_70`. (This is a different mechanism from `error-openpoints-env.md` in the
+> pointnext-lightning repo, which was that sibling project's own prebuilt
+> `cu118_pt271` openpoints extensions — compiled for `sm_89` — hitting the same
+> error text in a cu118 conda env; that diagnosis does not transfer here, where
+> the gap is in torch itself, not in our extensions.) Driver 570.144 ≥ 570, so
 > saturn14 otherwise meets every other gate (CUDA ≤ 12.8, singularity `--nv` ok,
-> ample `/tmp`/`/scratch` for an image build).
+> ample `/tmp`/`/scratch` for an image build) — the blocker is specifically
+> torch's removal of Volta from the cu128 wheel, not anything in this recipe.
 
 # Synthesis — what the image must be
 
@@ -363,15 +375,27 @@ iHPC 7.0/8.6/8.9; cetus 7.5/12.0), and the list now lives in
 [pointcept.Dockerfile](../pointcept.Dockerfile). `12.0+PTX` keeps forward
 compatibility for future hardware via PTX JIT.
 
-> **Caveat — saturn14 (V100, `sm_70`) not yet in the list.** The GPU matrix above
-> now includes `saturn14` as a fifth architecture, but `7.0` is **absent** from
-> `TORCH_CUDA_ARCH_LIST`. Two consequences: (1) the planned cu128 image will not
-> run on saturn14 — exactly the failure seen with the prebuilt `cu118_pt271`
-> openpoints extensions, which were compiled for `sm_89` (see
-> `error-openpoints-env.md` in the pointnext-lightning repo); and (2) to make
-> saturn14 a training target the list must become `7.0;7.5;8.6;8.9;12.0+PTX`
-> (or `7.0+PTX` for forward JIT). This is a *new* requirement discovered on
-> 2026-08-28; the four-architecture list remains correct for every other node.
+> **Caveat — saturn14 (V100, `sm_70`) is out of scope for this image, not
+> merely absent from the arch list.** Adding `7.0` to `TORCH_CUDA_ARCH_LIST`
+> would only recompile Pointcept's own extensions for Volta; it would not
+> restore the `torch.*` kernels saturn14 actually needs, because PyTorch's own
+> CUDA 12.8 wheel build drops Volta outright (`pytorch` tag `v2.7.1`,
+> `.ci/manywheel/build_cuda.sh` lines 54-62: *"removing sm_50-sm_70 as these
+> architectures are deprecated in CUDA 12.8 and will be removed in future
+> releases"*), and the only PTX it ships, `12.0+PTX`, JITs forward only.
+> Reaching saturn14 therefore requires a **second image on a `cuda12.6` base**,
+> not an arch-list change — the same build script resolves
+> `TORCH_CUDA_ARCH_LIST` to `5.0;6.0;7.0;7.5;8.0;8.6;9.0` for
+> `CUDA_VERSION=12.6`, which does include `7.0` but has no `12.0` and no `+PTX`
+> at all, so a cu126 image could not in turn cover cetus's RTX PRO 6000
+> Blackwell node. With torch 2.7.1, no single image covers both saturn14 and
+> cetus's Blackwell hardware. Volta is also deprecated in CUDA 12.x and removed
+> outright in CUDA 13 — a shrinking target — and the V100 already lacks
+> bfloat16 and FlashAttention-2 (both Ampere+, the same gap already recorded
+> for `sm_75` below), so a dedicated cu126 image for saturn14 is not worth
+> building without a concrete training need for that node. The
+> four-architecture list `7.5;8.6;8.9;12.0+PTX` remains correct for every other
+> node in the fleet.
 
 > **Caveat — cetus desk class not yet collected.** `hpc-desk01`‑`07` (1 GPU each,
 > in `iworkq`, currently **offline**) may carry a *fourth* architecture. If any
@@ -477,9 +501,16 @@ Ampere (`sm_80`). FlashAttention also requires `sm_80`+. So on `small_gpuq` and
 `med_gpuq`, the only queues that allow 24-48 h runs:
 
 - a `bf16` mixed-precision config will fail or silently fall back;
-- FlashAttention is unavailable — consistent with the RibSeg PTv3 config
-  already disabling it, and with [pointcept.Dockerfile](../pointcept.Dockerfile)
-  not installing it.
+- FlashAttention is unavailable — [pointcept.Dockerfile](../pointcept.Dockerfile)
+  does install flash-attention 2.8.3, and its prebuilt wheel actually carries
+  `sm_80`, `sm_90`, `sm_100` and `sm_120` cubins; of those, only `sm_80`
+  matters for this fleet (nothing here is Hopper or datacenter Blackwell), with
+  `sm_86`/`sm_89` devices running the `sm_80` cubin. It ships nothing for
+  `sm_75`, since FlashAttention-2 is Ampere-and-newer. So `small_gpuq` and
+  `med_gpuq` must run with `enable_flash=False`, consistent with the RibSeg
+  PTv3 config already disabling it. saturn14's V100 (`sm_70`) is likewise
+  pre-Ampere and shares this same bf16/FlashAttention gap with the Turing
+  queues here.
 
 Use `fp16` AMP or fp32 for anything that must run there, and keep `bf16` for the
 Blackwell nodes. This is a config concern, not an image concern, but it is
@@ -526,8 +557,10 @@ One residual sampling caveat, low risk: `hpc-exec03` stands for the whole
 each class uniform in cpu and memory, so this is a reasonable inference, but a
 job landing on an unsampled node with a different card would be outside the
 measured set. The `7.5;8.6;8.9;12.0+PTX` list covers every architecture seen on
-any cluster **except saturn14's V100 (`sm_70`)** — see the caveat under
-"Decisions this settles"; add `7.0` before relying on saturn14.
+any cluster **except saturn14's V100 (`sm_70`)** — see the corrected caveat
+under "Decisions this settles": saturn14 is out of scope for this image
+because torch's cu128 build drops Volta outright, and reaching it would
+require a separate `cuda12.6`-based image, not an arch-list edit.
 
 # collect-hwinfo.sh
 
