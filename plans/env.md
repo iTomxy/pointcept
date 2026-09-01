@@ -12,7 +12,7 @@ Determine by host name and go for the corresponding detail statements.
 # iHPC
 
 - Use singularity, not conda env.
-    - Image is `~/pointcept.sif`, also soft-linked at `/share/$(whoami)/pointcept.sif`.
+    - Image is `~/pointcept-cu128_pt271.sif` (new) or `~/pointcept.sif` (old, also soft-linked at `/share/$(whoami)/pointcept.sif`).
     - Refer to [singh.sh](../singu.sh).
 
 ## gpu
@@ -52,7 +52,7 @@ You can submit multiple jobs for parallel experiments.
 - The code folder should already sit on a large disk (/shared/homes/).
 The root log path can be placed under it directly.
 - Use singularity, not conda env.
-    - Image is `~/pointcept.sif`, also soft-linked at `/share/$(whoami)/pointcept.sif`.
+    - Image is `~/pointcept-cu128_pt271.sif` (new) or `~/pointcept.sif` (old, also soft-linked at `/share/$(whoami)/pointcept.sif`).
     - Refer to [singh.sh](../singu.sh).
 
 # cbai
