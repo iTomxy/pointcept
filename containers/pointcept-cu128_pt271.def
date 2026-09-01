@@ -18,6 +18,20 @@ Adds nibabel,MedPy,seaborn,opencv-python,camtools,jupyterlab,ipykernel
 # /opt/pointcept is deliberately not a fallback.
 export PYTHONPATH=.
 
+# matplotlib builds a font cache on first import and needs a writable config
+# dir. %test runs as root against the read-only .sif, and --contain/--no-home
+# runs have no writable HOME either; in both cases it warns and rebuilds the
+# cache on every import. pointcept/utils/misc.py imports pyplot at module
+# scope, so that cost lands on every training process, DDP ranks and dataloader
+# workers included. Prefer HOME so the font cache persists between runs; fall
+# back to TMPDIR, the same convention tests/test_env.py uses for
+# CUDA_CACHE_PATH and TORCH_EXTENSIONS_DIR.
+if [ -w "${HOME:-/}" ]; then
+    export MPLCONFIGDIR="${MPLCONFIGDIR:-$HOME/.cache/matplotlib}"
+else
+    export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/${USER:-uid-$(id -u)}/matplotlib}"
+fi
+
 %post
 
 # Apptainer takes the build result from this script's exit status, and the
