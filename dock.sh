@@ -31,6 +31,7 @@ docker run --rm "${TTY[@]}" \
   -v /usr/lib/x86_64-linux-gnu/nvidia:/usr/lib/x86_64-linux-gnu/nvidia \
   -v "$HOME:$HOME" \
   -v "$PROJ:$PROJ" \
+  -v /straxdata:/straxdata \
   --workdir "$PROJ" \
   --shm-size=16g \
   "$IMAGE" "$@"
