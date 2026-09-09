@@ -14,17 +14,15 @@ PREPROC_IGNORE_VOLUMES = (452, 485, 490)
 ALL_VOLUMES = tuple(range(1, 661))
 
 
-def _load_sieve(sieve_path, ref_affine, ref_shape, vid):
-    """Load a stage-1 sieve onto the grid `ref_affine`/`ref_shape` describe.
+def _load_aligned_volume(path, ref_affine, ref_shape, vid, dtype=np.int8, what="sieve"):
+    """Load a NIfTI volume onto the grid ``ref_affine``/``ref_shape`` describe.
 
-    The sieve only means anything voxel-for-voxel against the volume it
-    filters, and `recon_3d_bin_pred` can write it in either of two frames: the
-    scan's own orientation, or -- under `cache_root` -- the cache's LPS.
-    Reorienting by the sieve's OWN axcodes (not the volume's) is what makes
-    both line up, and it is why the sieve must NOT be carried through the
-    shared `Reorient` alongside the image: that call derives `old_ornt` from
-    whatever affine it is given, so a sieve already in LPS would be turned
-    OUT of it if it rode along with the image's affine.
+    The loaded volume only means anything voxel-for-voxel against the reference
+    grid. Reorienting by its OWN axcodes (not the reference volume's) is what
+    makes both line up, and it is why an auxiliary volume must NOT be carried
+    through the shared `Reorient` alongside the image: that call derives
+    `old_ornt` from whatever affine it is given, so an auxiliary volume already
+    in LPS would be turned OUT of it if it rode along with the image's affine.
 
     The affine check below is what actually pins the correspondence.
     RibSegv2 volume 491 is RAS where all 659 others are LPS (verified against
@@ -40,39 +38,58 @@ def _load_sieve(sieve_path, ref_affine, ref_shape, vid):
     above that.
 
     Input:
-        sieve_path: str, path to the stage-1 sieve NIfTI ({-1, 0, 1} int8)
+        path: str or PathLike, path to the auxiliary NIfTI.
         ref_affine: float[4, 4], affine of the volume this sieve filters
         ref_shape: int[3], nifti_shape of the volume this sieve filters
         vid: int, volume id, used in error messages only
+        dtype: numpy dtype used to materialise the NIfTI array.
+        what: human-readable name used in validation errors.
     Output:
-        sieve: int8[H, W, L], the sieve reoriented onto `ref_affine`/`ref_shape`
+        volume: [H, W, L], reoriented onto `ref_affine`/`ref_shape`
     """
-    nii = nib.load(sieve_path)
+    nii = nib.load(os.fspath(path))
     # dataobj, not get_fdata: the latter materialises a float64 copy of the
     # whole 512x512xZ volume in order to carry three distinct int8 values.
-    arr = np.asanyarray(nii.dataobj).astype(np.int8)
+    arr = np.asanyarray(nii.dataobj).astype(dtype)
     # Reorient by the sieve's OWN geometry, as a private dict -- not through
     # the `read`/`Reorient` step used for the image, which would reorient by
     # the image's affine instead (see docstring above).
-    data = Reorient(keys=("sieve_mask",), new_ornt="LPS")({
-        "sieve_mask": arr,
+    data = Reorient(keys=("aligned_volume",), new_ornt="LPS")({
+        "aligned_volume": arr,
         "affine": nii.affine.copy(),
         "nifti_shape": nii.shape,
     })
     # `Reorient` only rewrites "nifti_shape" when a reorientation is actually
     # needed, so this is valid to read either way.
-    assert tuple(data["nifti_shape"]) == tuple(ref_shape), (
-        "Volume {}: sieve {} is {} after reorientation but the volume it "
-        "filters is {}".format(vid, sieve_path, tuple(data["nifti_shape"]), tuple(ref_shape))
-    )
-    assert np.allclose(data["affine"], ref_affine, atol=1e-4), (
-        "Volume {}: sieve {} does not sit on the same grid as the volume it "
-        "filters. Reoriented sieve affine:\n{}\nexpected:\n{}\nThe sieve and "
-        "the points it selects must come from the same scan.".format(
-            vid, sieve_path, data["affine"], np.asarray(ref_affine)
+    if tuple(data["nifti_shape"]) != tuple(ref_shape):
+        raise ValueError(
+            "Volume {}: {} {} is {} after reorientation but the reference grid "
+            "is {}".format(
+                vid, what, path, tuple(data["nifti_shape"]), tuple(ref_shape)
+            )
         )
+    if not np.allclose(data["affine"], ref_affine, atol=1e-4):
+        raise ValueError(
+            "Volume {}: {} {} does not sit on the same grid as the volume it "
+            "is loaded against. Reoriented {} affine:\n{}\nexpected:\n{}\nThe "
+            "auxiliary volume and the points it is indexed by must come from the "
+            "same scan.".format(
+                vid, what, path, what, data["affine"], np.asarray(ref_affine)
+            )
+        )
+    return data["aligned_volume"]
+
+
+def _load_sieve(sieve_path, ref_affine, ref_shape, vid):
+    """Load a stage-1 sieve onto the grid ``ref_affine``/``ref_shape`` describe."""
+    return _load_aligned_volume(
+        sieve_path,
+        ref_affine,
+        ref_shape,
+        vid,
+        dtype=np.int8,
+        what="sieve",
     )
-    return data["sieve_mask"]
 
 
 def _write_cache_npz(out_path, vid, affine, voxel_index, label, intensity, nifti_shape, stats):

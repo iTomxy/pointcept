@@ -17,6 +17,7 @@ from torch.nn.parallel import DistributedDataParallel
 import pointcept.utils.comm as comm
 from pointcept.utils.env import get_random_seed, set_seed
 from pointcept.utils.config import Config, DictAction
+from pointcept.utils.misc import import_modules_from_strings
 
 
 def create_ddp_model(model, *, fp16_compression=False, **kwargs):
@@ -129,6 +130,19 @@ def default_config_parser(file_path, options):
 
 
 def default_setup(cfg):
+    # Ensure custom modules are imported in spawned workers (spawn lacks parent's imports).
+    # Config.fromfile handles this in the main process, but spawned children receive a
+    # pickled cfg and must re-import. Without this, transforms like CombineBoneLabel
+    # are not in the registry in workers (see 20260904-plus_totalseg_pred plan).
+    if "custom_imports" in cfg._cfg_dict and cfg._cfg_dict["custom_imports"] is not None:
+        try:
+            import_modules_from_strings(**cfg._cfg_dict["custom_imports"])
+        except Exception:
+            # Fallback to attribute access if _cfg_dict key is a ConfigDict
+            try:
+                import_modules_from_strings(**cfg.custom_imports)
+            except Exception:
+                pass
     # scalar by world size
     world_size = comm.get_world_size()
     cfg.num_worker = cfg.num_worker if cfg.num_worker is not None else mp.cpu_count()

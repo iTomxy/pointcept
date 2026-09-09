@@ -18,16 +18,20 @@ class Ribsegv2Dataset(DefaultDataset):
         ./transform.py/index_operator/"index_valid_keys"
     for details.
     """
-    def __init__(self, cache_root=None, **kwargs):
+    def __init__(self, cache_root=None, bone_label_granularity=None, **kwargs):
         """
         cache_root: str = None, directory of preprocessed .npz volumes;
             defaults to {data_root}/pt_preproc. Point at
             <stage-1 log>/pt_preproc-binpred for a stage-2 run -- see
             preproc.preprocess_ptcloud.
+        bone_label_granularity: str = None, optional ``coarse``/``fine``
+            selector consumed by ``CombineBoneLabel``. Sample metadata keeps
+            both TotalSegmentator phases on one inherited PTv3 pipeline.
         """
         # set before super().__init__, which calls self.get_data_list() at
         # the end and get_data() may run before this returns.
         self.cache_root = os.path.expanduser(cache_root) if cache_root else None
+        self.bone_label_granularity = bone_label_granularity
         super(Ribsegv2Dataset, self).__init__(**kwargs)
 
     def get_data_list(self):
@@ -36,7 +40,7 @@ class Ribsegv2Dataset(DefaultDataset):
     def get_data(self, idx):
         volume_id = self.data_list[idx % len(self.data_list)]
         cache_root = self.cache_root or os.path.join(self.data_root, "pt_preproc")
-        return {
+        data = {
             "name": str(volume_id),
             "index_valid_keys": ["coord", "strength", "segment", "voxel_index"], # don't use tuple
             # "intensity": os.path.join(self.data_root, "image", "RibFrac{}-image.nii.gz".format(volume_id)),
@@ -49,6 +53,9 @@ class Ribsegv2Dataset(DefaultDataset):
             # a string that nothing consumes.
             # "sieve_mask": os.path.join(self.data_root, "binpred", "{}.nii.gz".format(volume_id)),
         }
+        if self.bone_label_granularity is not None:
+            data["bone_label_granularity"] = self.bone_label_granularity
+        return data
 
 
 @DATASETS.register_module()
@@ -72,6 +79,7 @@ class Ribsegv2VolumeDataset(Dataset):
         add_trainval_incomplete=False, # also test on incomplete volumes from train & val
         test_all_incomplete=False, # test on incomplete volumes only, from every split
         cache_root=None, # str, dir of preprocessed .npz volumes; see docstring below
+        bone_label_granularity=None, # consumed by CombineBoneLabel
     ):
         """
         cache_root: str = None, directory of preprocessed .npz volumes; defaults
@@ -83,6 +91,7 @@ class Ribsegv2VolumeDataset(Dataset):
         self.data_root = data_root
         self.transform = Compose(transform)
         self.cache_root = os.path.expanduser(cache_root) if cache_root else os.path.join(data_root, "pt_preproc")
+        self.bone_label_granularity = bone_label_granularity
 
         if test_all_incomplete:
             print("Test with all incomplete volumes from train, val and test set.")
@@ -104,14 +113,17 @@ class Ribsegv2VolumeDataset(Dataset):
 
     def __getitem__(self, idx):
         volume_id = self.data_list[idx]
-        data_dict = self.transform({
+        source = {
             "index_valid_keys": list(self.INDEX_VALID_KEYS),
             "npz": os.path.join(self.cache_root, "{}.npz".format(volume_id)),
             # legacy of the online-sieving pipeline: the sieve is now applied offline by
             # preproc.preprocess_ptcloud(binpred_path=...), and under ReadNpz this key stays
             # a string that nothing consumes.
             # "sieve_mask": os.path.join(self.data_root, "binpred", "{}.nii.gz".format(volume_id)),
-        })
+        }
+        if self.bone_label_granularity is not None:
+            source["bone_label_granularity"] = self.bone_label_granularity
+        data_dict = self.transform(source)
         # after Collect, which keeps only the keys it was asked for
         data_dict["name"] = str(volume_id)
         return data_dict

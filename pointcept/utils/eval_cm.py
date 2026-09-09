@@ -340,60 +340,77 @@ def clswise_nsr_dist(pred, label, num_classes=25):
     }
 
 
-def compute_prediction_integrity(pred: np.ndarray, y: np.ndarray) -> dict:
+def compute_prediction_integrity(
+    pred: np.ndarray, y: np.ndarray, bg_class: int = 0
+) -> dict:
     """
     Quantify the fractional/broken prediction level for rib semantic segmentation.
 
-    For each ground-truth rib, checks how many distinct predicted labels its points
-    received. A perfectly intact prediction means all points of a rib are assigned
-    a single predicted class. Fragmentation occurs when points of one rib are split
-    across multiple predicted classes.
+    For each ground-truth rib, checks how many distinct non-background predicted
+    labels its recognized points received. Background predictions are excluded so
+    foreground misses do not count as label fragmentation. A perfectly intact
+    prediction means all recognized points of a rib are assigned a single rib
+    class. Fragmentation occurs when they are split across multiple rib classes.
 
     Args:
         pred: np.ndarray of shape [N], predicted point-wise class IDs
         y:    np.ndarray of shape [N], ground-truth point-wise class IDs
+        bg_class: int, background class excluded from the integrity calculation
 
     Returns:
         dict with keys:
           - 'per_class_integrity': dict mapping gt_class -> integrity score in [0, 1]
-                1.0 = all points predicted as a single class (perfectly intact)
-                0.0 = maximally fragmented
+                1.0 = all recognized points predicted as one rib class
+                NaN = the entire GT rib was predicted as background
           - 'per_class_dominant_pred': dict mapping gt_class -> most common predicted label
           - 'per_class_fragment_counts': dict mapping gt_class -> number of distinct predicted labels
-          - 'per_class_pred_distribution': dict mapping gt_class -> {pred_label: point_count}
-          - 'mean_integrity': float, mean integrity across all gt classes present (excl. background)
-          - 'weighted_mean_integrity': float, point-count-weighted mean integrity (excl. background)
-          - 'global_integrity': float, fraction of points correctly assigned to the dominant
-                predicted label within each gt class (excl. background)
+          - 'per_class_pred_distribution': dict mapping gt_class -> non-background
+                {pred_label: point_count}
+          - 'per_class_recognized_points': dict mapping gt_class -> number of
+                non-background predictions used as the integrity denominator
+          - 'mean_integrity': float, mean across GT classes with recognized points
+          - 'weighted_mean_integrity': float, recognized-point-weighted mean
+          - 'global_integrity': float, fraction of recognized GT-rib points assigned
+                to each GT class's dominant predicted rib label
     """
     assert pred.shape == y.shape, "pred and y must have the same shape"
 
     gt_classes = np.unique(y)
-    rib_classes = gt_classes[gt_classes != 0]  # exclude background (class 0)
+    rib_classes = gt_classes[gt_classes != bg_class]
 
     per_class_integrity = {}
     per_class_dominant_pred = {}
     per_class_fragment_counts = {}
     per_class_pred_distribution = {}
+    per_class_recognized_points = {}
 
-    total_rib_points = 0
-    weighted_integrity_sum = 0.0
-    dominant_correct_points = 0
+    valid_integrities = []
+    total_recognized_points = 0
+    total_dominant_points = 0
 
     for gt_cls in rib_classes:
         mask = y == gt_cls
         preds_for_cls = pred[mask]
-        n_points = mask.sum()
+        recognized_preds = preds_for_cls[preds_for_cls != bg_class]
+        n_recognized = recognized_preds.size
+        per_class_recognized_points[int(gt_cls)] = int(n_recognized)
 
-        unique_preds, counts = np.unique(preds_for_cls, return_counts=True)
+        if n_recognized == 0:
+            per_class_integrity[int(gt_cls)] = float("nan")
+            per_class_dominant_pred[int(gt_cls)] = None
+            per_class_fragment_counts[int(gt_cls)] = 0
+            per_class_pred_distribution[int(gt_cls)] = {}
+            continue
+
+        unique_preds, counts = np.unique(recognized_preds, return_counts=True)
         n_fragments = len(unique_preds)
 
         dominant_pred = unique_preds[np.argmax(counts)]
         dominant_count = counts.max()
 
-        # Integrity: fraction of points assigned to the single dominant predicted label.
-        # 1.0 = no fragmentation; lower = more broken/fractional.
-        integrity = dominant_count / n_points
+        # Integrity is conditioned on recognized points; FN-background points
+        # are measured separately and do not count as label fragmentation.
+        integrity = dominant_count / n_recognized
 
         per_class_integrity[int(gt_cls)] = float(integrity)
         per_class_dominant_pred[int(gt_cls)] = int(dominant_pred)
@@ -402,18 +419,22 @@ def compute_prediction_integrity(pred: np.ndarray, y: np.ndarray) -> dict:
             int(p): int(c) for p, c in zip(unique_preds, counts)
         }
 
-        weighted_integrity_sum += integrity * n_points
-        dominant_correct_points += dominant_count
-        total_rib_points += n_points
+        valid_integrities.append(integrity)
+        total_dominant_points += dominant_count
+        total_recognized_points += n_recognized
 
     mean_integrity = (
-        float(np.mean(list(per_class_integrity.values()))) if per_class_integrity else 0.0
+        float(np.mean(valid_integrities)) if valid_integrities else float("nan")
     )
     weighted_mean_integrity = (
-        weighted_integrity_sum / total_rib_points if total_rib_points > 0 else 0.0
+        total_dominant_points / total_recognized_points
+        if total_recognized_points > 0
+        else float("nan")
     )
     global_integrity = (
-        dominant_correct_points / total_rib_points if total_rib_points > 0 else 0.0
+        total_dominant_points / total_recognized_points
+        if total_recognized_points > 0
+        else float("nan")
     )
 
     return {
@@ -421,6 +442,7 @@ def compute_prediction_integrity(pred: np.ndarray, y: np.ndarray) -> dict:
         "per_class_dominant_pred": per_class_dominant_pred,
         "per_class_fragment_counts": per_class_fragment_counts,
         "per_class_pred_distribution": per_class_pred_distribution,
+        "per_class_recognized_points": per_class_recognized_points,
         "mean_integrity": mean_integrity,
         "weighted_mean_integrity": weighted_mean_integrity,
         "global_integrity": global_integrity,
@@ -712,7 +734,7 @@ def eval_volume(pred, label, n_grid, num_classes, bg_class, metrics, rib_metrics
         row["n_points"] = int(label.size)
         row["n_grid_points"] = int(n_grid)
         row.update(error_rate(pred, label, bg_class))
-        integrity = compute_prediction_integrity(pred, label)
+        integrity = compute_prediction_integrity(pred, label, bg_class=bg_class)
         row.update({k: integrity[k] for k in ("mean_integrity", "weighted_mean_integrity", "global_integrity")})
         if rib_metrics:
             row.update(error_rate_rib(pred, label, bg_class))
