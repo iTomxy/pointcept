@@ -695,7 +695,7 @@ class SemSegEvaluator:
 
 # Default metric set for the RibSegv2 volume-wise reports. Lives here rather than
 # on `Ribsegv2VolumeTester` so a CPU-only post-processing script (e.g.
-# tools/combine_2stage.py) can score with the same set without importing
+# tools/ribsegv2/combine_2stage.py) can score with the same set without importing
 # pointcept.engines.test, which pulls in the `pointops` CUDA extension.
 RIBSEG_DEFAULT_METRICS = ("dice", "iou", "precision", "recall", "specificity", "accuracy")
 
@@ -704,7 +704,7 @@ def eval_volume(pred, label, n_grid, num_classes, bg_class, metrics, rib_metrics
     """all metrics of a single volume, at full resolution
 
     Extracted from `Ribsegv2VolumeTester.eval_volume` (A10) so it can be reused
-    from a plain script (e.g. `tools/combine_2stage.py`) without a CUDA model
+    from a plain script (e.g. `tools/ribsegv2/combine_2stage.py`) without a CUDA model
     or a dataloader behind it.
     Args:
         pred: int numpy.ndarray[n_points], point-wise predicted class id

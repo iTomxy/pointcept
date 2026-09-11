@@ -27,7 +27,7 @@ cannot drift from the per-stage ones.
 Usage (from the repo root -- `pointcept/datasets/ribsegv2/base.py` reads
 `data/ribsegv2/ribsegv2-statistics.json` through a bare relative path at import
 time, so any other working directory fails there):
-    python tools/combine_2stage.py --stage1-pred <s1_log>/result \
+    python tools/ribsegv2/combine_2stage.py --stage1-pred <s1_log>/result \
         --stage2-pred <s2_log>/result --cache-root data/ribsegv2/pt_preproc \
         --split test --save-path <s2_log>
 """
@@ -35,9 +35,9 @@ time, so any other working directory fails there):
 import os
 import sys
 
-# runnable as `python tools/<name>.py` from anywhere; scripts/*.sh instead export
-# PYTHONPATH, so guard against inserting the repo root twice
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# runnable as `python tools/ribsegv2/<name>.py` from anywhere; scripts/*.sh
+# instead export PYTHONPATH, so guard against inserting the repo root twice
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 

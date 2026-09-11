@@ -45,13 +45,13 @@ data = dict(
     test=dict(
         cache_root=cache_root,
         # Scored on the foreground-only cloud here; the number that goes in the
-        # Performance Table is the COMBINED one, from tools/combine_2stage.py,
+        # Performance Table is the COMBINED one, from tools/ribsegv2/combine_2stage.py,
         # which scores over the full stage-1 point set instead.
         split="test",
     ),
 )
 
 test = dict(
-    # tools/combine_2stage.py merges these with stage 1's.
+    # tools/ribsegv2/combine_2stage.py merges these with stage 1's.
     save_pred=True,
 )

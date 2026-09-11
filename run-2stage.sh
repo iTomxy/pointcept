@@ -269,7 +269,7 @@ fi
 if has_step combine; then
     for SPLIT in $EVAL_SPLITS; do
         echo "=== [combine] $SPLIT"
-        $PYTHON tools/combine_2stage.py \
+        $PYTHON tools/ribsegv2/combine_2stage.py \
             --stage1-pred "$S1_DIR/result" \
             --stage2-pred "$S2_DIR/result" \
             --cache-root "$CACHE_ROOT" \
