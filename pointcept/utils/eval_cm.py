@@ -449,6 +449,140 @@ def compute_prediction_integrity(
     }
 
 
+def foreground_confusion_metrics(conf_mat):
+    """Return per-rib integrity statistics from one full-resolution matrix.
+
+    ``conf_mat`` has ground-truth classes on rows and predicted classes on
+    columns.  This public helper deliberately only accepts RibSegV2's 25-class
+    convention (background at index zero), so callers cannot accidentally
+    attach anatomical-rib semantics to a generic segmentation task.  The four
+    returned lists are class aligned and JSON-safe: their background entry is
+    ``None`` and absent/unrecognized ribs retain the distinctions described in
+    the field names.
+    """
+    conf_mat = np.asarray(conf_mat)
+    if conf_mat.shape != (25, 25):
+        raise ValueError(
+            "foreground_confusion_metrics requires a 25x25 confusion matrix "
+            "with background at index 0, got {}".format(conf_mat.shape)
+        )
+    if conf_mat.dtype.kind not in "iuf" or not np.all(np.isfinite(conf_mat)):
+        raise ValueError("confusion matrix counts must be finite real numbers")
+    if np.any(conf_mat < 0) or np.any(conf_mat != np.floor(conf_mat)):
+        raise ValueError("confusion matrix counts must be non-negative integers")
+
+    fg = conf_mat[1:, 1:]
+    purity = [None] * 25
+    recall = [None] * 25
+    fragments = [None] * 25
+    coverage = [None] * 25
+    for cls in range(1, 25):
+        row_total = conf_mat[cls].sum()
+        if row_total == 0:
+            continue  # anatomically absent in this volume
+        recognized = fg[cls - 1].sum()
+        coverage[cls] = float(recognized / row_total)
+        if recognized == 0:
+            continue  # present, but entirely predicted as background
+        fg_row = fg[cls - 1]
+        purity[cls] = float(fg_row.max() / recognized)
+        recall[cls] = float(fg_row[cls - 1] / recognized)
+        fragments[cls] = int(np.count_nonzero(fg_row / recognized >= 0.05))
+    return {
+        "fg_purity_cw": purity,
+        "fg_recall_cw": recall,
+        "fg_fragment_count_5pct_cw": fragments,
+        "fg_recognition_coverage_cw": coverage,
+    }
+
+
+def summarize_foreground_confusion(records, purity_threshold=0.9):
+    """Summarize class-aligned foreground metrics over ``(volume, rib)`` pairs.
+
+    This intentionally consumes per-volume rows rather than a pooled confusion
+    matrix: purity order statistics and fragment rates give every present rib
+    in every volume equal weight.  Rows from older JSONL logs that lack these
+    fields are ignored rather than treated as missing/failed ribs.
+
+    ``fg_purity_tail_*`` describes only scored volume/rib pairs whose purity is
+    strictly below ``purity_threshold`` (a fraction, default 0.9). Filter the
+    individual pairs before computing order statistics; do not average by rib
+    or volume first. An empty subset has count zero and null order statistics.
+    The existing unfiltered summaries retain their definitions.
+    """
+    if not np.isfinite(purity_threshold) or not 0 <= purity_threshold <= 1:
+        raise ValueError("purity_threshold must be a finite fraction in [0, 1]")
+    keys = (
+        "fg_purity_mean", "fg_purity_min", "fg_purity_median", "fg_purity_max",
+        "fg_fragment_count_5pct_mean", "fg_fragment_gt1_fraction",
+        "fg_fragment_eq0_fraction", "fg_scored_pair_count", "fg_absent_pair_count",
+        "fg_unrecognized_pair_count", "fg_purity_lt95_fraction",
+        "fg_purity_lt95_volume_count", "fg_recognition_coverage_mean",
+        "fg_purity_tail_median", "fg_purity_tail_max", "fg_purity_tail_min",
+    )
+    result = {key: None for key in keys}
+    result["fg_purity_tail_threshold"] = float(purity_threshold)
+    result["fg_purity_tail_count"] = 0
+    purity_values, fragment_values, coverage_values = [], [], []
+    absent_count = unrecognized_count = tail_volume_count = 0
+    for record in records.values() if isinstance(records, dict) else records:
+        purity = record.get("fg_purity_cw")
+        coverage = record.get("fg_recognition_coverage_cw")
+        fragments = record.get("fg_fragment_count_5pct_cw")
+        if not (isinstance(purity, (list, tuple)) and len(purity) == 25 and
+                isinstance(coverage, (list, tuple)) and len(coverage) == 25 and
+                isinstance(fragments, (list, tuple)) and len(fragments) == 25):
+            continue
+        has_tail = False
+        for cls in range(1, 25):
+            p, cov, frag = purity[cls], coverage[cls], fragments[cls]
+            if cov is None:
+                absent_count += 1
+            elif p is None:
+                unrecognized_count += 1
+                coverage_values.append(float(cov))
+            else:
+                # A scored pair always has all three fields.  Ignore malformed
+                # historical/manual rows rather than inventing a statistic.
+                if frag is None:
+                    continue
+                p, frag, cov = float(p), int(frag), float(cov)
+                purity_values.append(p)
+                fragment_values.append(frag)
+                coverage_values.append(cov)
+                has_tail |= p < 0.95
+        tail_volume_count += int(has_tail)
+
+    result["fg_scored_pair_count"] = len(purity_values)
+    result["fg_absent_pair_count"] = absent_count
+    result["fg_unrecognized_pair_count"] = unrecognized_count
+    result["fg_purity_lt95_volume_count"] = tail_volume_count
+    if purity_values:
+        p = np.asarray(purity_values, dtype=float)
+        tail = p[p < purity_threshold]
+        result["fg_purity_tail_count"] = int(tail.size)
+        if tail.size:
+            result.update({
+                "fg_purity_tail_median": float(np.median(tail)),
+                "fg_purity_tail_max": float(np.max(tail)),
+                "fg_purity_tail_min": float(np.min(tail)),
+            })
+        fragments = np.asarray(fragment_values, dtype=float)
+        result.update({
+            "fg_purity_mean": float(np.mean(p)),
+            "fg_purity_min": float(np.min(p)),
+            "fg_purity_median": float(np.median(p)),
+            "fg_purity_max": float(np.max(p)),
+            "fg_fragment_count_5pct_mean": float(np.mean(fragments)),
+            "fg_fragment_gt1_fraction": float(np.mean(fragments > 1)),
+            "fg_fragment_eq0_fraction": float(np.mean(fragments == 0)),
+            "fg_purity_lt95_fraction": float(np.mean(p < 0.95)),
+        })
+    if coverage_values:
+        result["fg_recognition_coverage_mean"] = float(np.mean(coverage_values))
+    return result
+
+
 def rib_label_acc(pred, y, recall_thres=0.7):
     """label accuracy defined in Sec. V.A.1 in RibSegv2 (https://arxiv.org/abs/2210.09309)
     Args:
@@ -700,7 +834,8 @@ class SemSegEvaluator:
 RIBSEG_DEFAULT_METRICS = ("dice", "iou", "precision", "recall", "specificity", "accuracy")
 
 
-def eval_volume(pred, label, n_grid, num_classes, bg_class, metrics, rib_metrics=False):
+def eval_volume(pred, label, n_grid, num_classes, bg_class, metrics, rib_metrics=False,
+                conf_mat=None):
     """all metrics of a single volume, at full resolution
 
     Extracted from `Ribsegv2VolumeTester.eval_volume` (A10) so it can be reused
@@ -716,6 +851,11 @@ def eval_volume(pred, label, n_grid, num_classes, bg_class, metrics, rib_metrics
         rib_metrics: bool = False, also report the rib-index metrics (shift
             rates, label accuracy, off-by-one confusion). They hard-code the
             25-class rib set; only set this for that class count.
+        conf_mat: optional full-resolution [num_classes, num_classes] matrix
+            with GT rows and prediction columns.  Reusing the tester's matrix
+            avoids a second full-array bincount.  It is required only to
+            persist the RibSegV2 integrity matrix; standalone callers may omit
+            it and it will be computed once here.
     Returns:
         dict, `<metric>_cw` holds per-class values (NaN where the class is
         absent from this volume) and the rest are volume-level scalars.
@@ -736,12 +876,26 @@ def eval_volume(pred, label, n_grid, num_classes, bg_class, metrics, rib_metrics
         row.update(error_rate(pred, label, bg_class))
         integrity = compute_prediction_integrity(pred, label, bg_class=bg_class)
         row.update({k: integrity[k] for k in ("mean_integrity", "weighted_mean_integrity", "global_integrity")})
-        if rib_metrics:
+        is_rib_task = rib_metrics and num_classes == 25 and bg_class == 0
+        if is_rib_task:
             row.update(error_rate_rib(pred, label, bg_class))
             row.update(rib_label_acc(pred, label))
             # left/right and class-wise breakdown of the rib-id shift
             shift = rib_id_shift_rate(pred, label)
             row.update({k: shift[k] for k in ("nsr_left", "nsr_right", "fsr_left", "fsr_right", "nsr_cw", "fsr_cw")})
+            if conf_mat is None:
+                conf_mat = np.bincount(
+                    label.astype(np.int64) * num_classes + pred.astype(np.int64),
+                    minlength=num_classes * num_classes,
+                ).reshape(num_classes, num_classes)
+            else:
+                conf_mat = np.asarray(conf_mat)
+                if conf_mat.shape != (num_classes, num_classes):
+                    raise ValueError("conf_mat shape {} does not match {} classes".format(
+                        conf_mat.shape, num_classes
+                    ))
+            row["confusion"] = conf_mat.tolist()
+            row.update(foreground_confusion_metrics(conf_mat))
     return row
 
 
@@ -791,8 +945,14 @@ def reduce_records(records, conf_mat, num_classes, bg_class, metrics, rib_metric
         summary[k] = nanmean(vals)
         summary[k + "_vol"] = calc_stat(vals, percentages=[5, 25, 50, 75, 95], prec=4)
 
-    if not rib_metrics:
+    is_rib_task = rib_metrics and num_classes == 25 and bg_class == 0
+    if not is_rib_task:
         return summary
+
+    # These are volume/rib-pair statistics, never statistics from the pooled
+    # matrix below.  Do not manufacture them when reducing older records.
+    if any("fg_purity_cw" in records[name] for name in order):
+        summary.update(summarize_foreground_confusion(records))
 
     # Is the residual rib-vs-rib confusion concentrated on adjacent ribs?
     # A dominant off-by-one band means the model cannot count ribs from the

@@ -1384,10 +1384,13 @@ class Ribsegv2VolumeTester(TesterBase):
         self.num_classes = cfg.data.num_classes
         self.bg_class = cfg.data.bg_class
         self.rib_metrics = (
-            self.num_classes == self.N_RIB_CLASSES if rib_metrics is None else rib_metrics
+            self.num_classes == self.N_RIB_CLASSES and self.bg_class == 0
+            if rib_metrics is None else rib_metrics
         )
-        assert not (self.rib_metrics and self.num_classes != self.N_RIB_CLASSES), (
-            "rib_metrics needs exactly {} classes, got {}".format(self.N_RIB_CLASSES, self.num_classes)
+        assert not (self.rib_metrics and (self.num_classes != self.N_RIB_CLASSES or self.bg_class != 0)), (
+            "rib_metrics needs {} classes with background class 0, got {} classes and bg {}".format(
+                self.N_RIB_CLASSES, self.num_classes, self.bg_class
+            )
         )
         super().__init__(cfg, model=model, test_loader=test_loader, verbose=verbose)
 
@@ -1458,11 +1461,13 @@ class Ribsegv2VolumeTester(TesterBase):
             assert pred.shape == label.shape, \
                 "volume {}: pred {} vs label {}".format(name, pred.shape, label.shape)
 
-            records[name] = self.eval_volume(pred, label, n_grid=pred_grid.shape[0])
             conf_mats[name] = np.bincount(
                 label.astype(np.int64) * n_cls + pred.astype(np.int64),
                 minlength=n_cls * n_cls,
             ).reshape(n_cls, n_cls)
+            records[name] = self.eval_volume(
+                pred, label, n_grid=pred_grid.shape[0], conf_mat=conf_mats[name]
+            )
             if self.save_pred:
                 assert affine is not None, (
                     "volume {}: save_pred requires the test pipeline to Collect `affine`"
@@ -1543,11 +1548,14 @@ class Ribsegv2VolumeTester(TesterBase):
             logger.info("{}: {}".format(k, v))
         logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
 
-    def eval_volume(self, pred, label, n_grid):
+    def eval_volume(self, pred, label, n_grid, conf_mat=None):
         """all metrics of a single volume, at full resolution -- see
         `pointcept.utils.eval_cm.eval_volume` (A10) for the implementation and docstring.
         """
-        return eval_volume(pred, label, n_grid, self.num_classes, self.bg_class, self.metrics, self.rib_metrics)
+        return eval_volume(
+            pred, label, n_grid, self.num_classes, self.bg_class, self.metrics,
+            self.rib_metrics, conf_mat=conf_mat
+        )
 
     def reduce(self, records, conf_mat):
         """average every per-volume record across volumes -- see

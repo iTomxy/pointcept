@@ -72,8 +72,11 @@ hooks = [
     # dict(type="PreciseEvaluator", test_last=False),
 ]
 
-# Pinned, not re-measured per run -- and that is the point. Both numbers carry
-# measurement variance larger than the effects they would be tuning:
+# Reference batch/LRs below reproduce the tuned historical recipe. For new
+# runs, measure a stable batch on the allocated GPUs, then tune LR at that
+# actual total batch. Override the reference values and save the resolved
+# per-run config; update both optimizer groups and OneCycle maxima together.
+# Earlier searches exposed measurement variance that the runner must account for:
 #   batch  memory-determined, ~5-10% run-to-run; near the ceiling that variance
 #          silently halves the batch for one arm and not another. It happened
 #          twice mid-sweep and cost 2.5 and 6.5 pt.
@@ -81,9 +84,10 @@ hooks = [
 #          byte-identical configs, because a transient loss spike moves the
 #          curve's argmin across it. There is a cliff just above 0.010 worth
 #          -2.22 pt (measured, `exp/ribsegv2/opt-lr2x/`).
-# Re-measure only when the model or the card changes enough that these may not
-# even be stable; then pin the new values with FIXED_BS / FIXED_LR
-# (tools/, tmp-ai-tune_hp.sh) for every arm of the comparison.
+# Check the largest capped training batch and confirm LR-search suggestions
+# with stable training/validation. The run's hardware, chosen batch, LR curve
+# and final group rates belong in its artifacts; do not reuse another arm's
+# batch/LRs as mandatory settings.
 # Measured on 2x V100-32GB at mem_frac=0.9 against the worst batch this pipeline
 # can build (batch_size x max_points points): 2/gpu -> 19.2 GiB (67% of budget),
 # 3/gpu -> 29.3 GiB (over). Also fits 2x RTX A5500 24GB and 1x L4 22GB.

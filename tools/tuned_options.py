@@ -25,7 +25,15 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import argparse, json
+import argparse, json, math
+import numbers
+
+
+def _positive_number(value, name):
+    if (isinstance(value, bool) or not isinstance(value, numbers.Real)
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError(f"{name} must be finite and positive")
+    return float(value)
 
 
 def parse_args(argv=None):
@@ -46,24 +54,43 @@ def build_options(config, bs_json="", lr_json="", lr_scale=1.0):
 
     if bs_json:
         bs = json.load(open(bs_json))
-        options.append(("batch_size", bs["batch_size"]))
+        batch_size = bs["batch_size"]
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        options.append(("batch_size", batch_size))
 
     if lr_json:
         lr = json.load(open(lr_json))
-        max_lr = lr["max_lr"]
-        assert max_lr, "lr_range_test produced no suggestion; inspect its curve"
-        max_lr *= lr_scale
-        options.append(("optimizer.lr", float("%.4g" % max_lr)))
+        max_lr = _positive_number(lr["max_lr"], "suggested max_lr")
+        lr_scale = _positive_number(lr_scale, "lr_scale")
+        if bs_json and lr.get("batch_size") != batch_size:
+            raise ValueError("batch_size and lr batch_size disagree")
+        max_lr = _positive_number(max_lr * lr_scale, "scaled learning rate")
+        params = cfg.get("param_dicts", None) or []
+        ratios = lr.get("lr_ratios")
+        if ratios is None and not params:
+            ratios = [1.0]
+        if not isinstance(ratios, (list, tuple)) or len(ratios) != len(params) + 1:
+            raise ValueError("lr_ratios must contain the default group and every param_dict")
+        ratios = [_positive_number(r, "LR ratio") for r in ratios]
+        if ratios[0] != 1.0:
+            raise ValueError("the default group's LR ratio must be 1")
+        rates = [_positive_number(max_lr * r, "group learning rate") for r in ratios]
+        rounded = [float("%.4g" % r) for r in rates]
+        options.append(("optimizer.lr", rounded[0]))
+        for i, rate in enumerate(rounded[1:]):
+            options.append(("param_dicts.%d.lr" % i, rate))
         sched = cfg.get("scheduler", None)
         if sched is not None and "max_lr" in sched:
-            ratios = lr.get("lr_ratios") or [1.0]
             if isinstance(sched["max_lr"], (list, tuple)):
-                assert len(sched["max_lr"]) == len(ratios), (
-                    "config has %d max_lr entries but the range test saw %d param groups"
-                    % (len(sched["max_lr"]), len(ratios)))
-                value = "[%s]" % ",".join("%.4g" % (max_lr * r) for r in ratios)
+                if len(sched["max_lr"]) != len(rates):
+                    raise ValueError(
+                        "config has %d max_lr entries but the range test saw %d param groups"
+                        % (len(sched["max_lr"]), len(rates)))
+            if isinstance(sched["max_lr"], (list, tuple)) or params:
+                value = "[%s]" % ",".join("%.4g" % r for r in rounded)
             else:
-                value = "%.4g" % max_lr
+                value = "%.4g" % rounded[0]
             options.append(("scheduler.max_lr", value))
     return options
 
