@@ -4,8 +4,9 @@ Improve label agreement along each rib without sacrificing rib-index correctness
 or foreground/background accuracy. The implementation is complete; the next
 agent will execute, monitor and record the **λ = 1, 5, 10** sweep below.
 Baseline and λ = 0.1 results are already available.
+The executing agent should follow [Steps](#steps) and update its checklist.
 
-Based on the [sibling plan](../../pointnext-lightning/plans/20260909-xxli_integrity_method_1.md)
+Based on the sibling plan [~/codes/pointnext-lightning/plans/20260909-xxli_integrity_method_1.md](../../pointnext-lightning/plans/20260909-xxli_integrity_method_1.md)
 and the [canonical PTv3 recipe](../configs/ribsegv2/semseg-pt_v3m1_0_base.py).
 
 ## Performance
@@ -36,11 +37,11 @@ in the assessment. Very diffuse predictions can have zero labels above 5%.
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | [Baseline](../exp/ribsegv2/ptv3-integrity-baseline-eval/) | 0 | 78 | 87.76 / 87.68 | 92.78 / 92.23 | 94.09 / 94.29 | 77.97 / 72.12 | 85.59 / 89.33 | 50.24 / 46.06 | 20 / 41 | 1.01 / 1.01 | 1.29 / 1.35 |
 | [Method 1, seed 1](../exp/ribsegv2/ptv3-integrity-m1-s1/) | 0.1 | 76 | 87.88 / 87.15 | 92.86 / 91.46 | 94.14 / 94.34 | 74.30 / 78.24 | 88.77 / 89.63 | 50.36 / 38.63 | 14 / 61 | 1.01 / 1.02 | 0.88 / 2.16 |
-| [Method 1, seed 1 — pending](../exp/ribsegv2/ptv3-integrity-m1-w1-s1/) | 1 | — | — / — | — / — | — / — | — / — | — / — | — / — | — / — | — / — | — / — |
-| [Method 1, seed 1 — pending](../exp/ribsegv2/ptv3-integrity-m1-w5-s1/) | 5 | — | — / — | — / — | — / — | — / — | — / — | — / — | — / — | — / — | — / — |
-| [Method 1, seed 1 — pending](../exp/ribsegv2/ptv3-integrity-m1-w10-s1/) | 10 | — | — / — | — / — | — / — | — / — | — / — | — / — | — / — | — / — | — / — |
+| [Method 1, seed 1](../exp/ribsegv2/ptv3-integrity-m1-w1-s1/) | 1 | 99 | 85.10 / — | 90.79 / — | 91.56 / — | 78.72 / — | 89.90 / — | 50.00 / — | 55 / — | 1.05 / — | 4.86 / — |
+| [Method 1, seed 1](../exp/ribsegv2/ptv3-integrity-m1-w5-s1/) | 5 | 96 | 79.21 / — | 86.66 / — | 87.20 / — | 76.09 / — | 89.81 / — | 50.37 / — | 231 / — | 1.20 / — | 19.28 / — |
+| [Method 1, seed 1](../exp/ribsegv2/ptv3-integrity-m1-w10-s1/) | 10 | 100 | 64.30 / — | 76.05 / — | 76.30 / — | 73.39 / — | 90.00 / — | 38.20 / — | 784 / — | 1.67 / — | 53.93 / — |
 
-Completed rows were measured on 2026-09-11/12 with evaluation seed **20260909**.
+Completed rows were measured on 2026-09-11/12/13/15 with evaluation seed **20260909**.
 Both used total batch 4, base LR 0.005102 and block LR 0.0005353; these describe
 those runs, not requirements for new runs. Baseline evaluates
 `exp/ribsegv2/final/model/model_best.pth`; method uses its own best checkpoint.
@@ -48,7 +49,10 @@ Full provenance is in the linked evaluation summaries and saved configs.
 
 **Current result:** λ = 0.1 improved validation low-purity counts (20 → 14),
 but test worsened (41 → 61), with IoU −0.53 percentage points and fragmentation
-1.35% → 2.16%. It is not adopted. No matched-seed repeats have been run.
+1.35% → 2.16%. It is not adopted. The λ = 1/5/10 sweep finished 2026-09-15:
+all three are val-negative with degradation growing in λ (val IoU 85.10 →
+79.21 → 64.30; low-purity pairs 55 → 231 → 784). **Baseline retained; no test
+evaluation run.** No matched-seed repeats have been run.
 
 ## Method and experiment controls
 
@@ -87,14 +91,80 @@ contrastive loss was 0.00142 versus segmentation loss 0.18190. Larger weights
 probe whether stronger supervision helps; scalar loss ratios do not establish
 relative backbone-gradient influence.
 
-## Execution handoff
+## Steps
 
-Execute the numbered stages in order. Complete stages 2–5 separately for
-**λ = 1, then 5, then 10**; each gets its own batch/LR search and run directory.
-Update the corresponding row to running, failed, or val complete as work
-progresses. Leave test cells blank until the selection in stage 6.
+Follow this checklist in order. Check completed actions and append a short
+result/date with an artifact link; record failures beside unchecked actions.
+Update each performance row as work progresses. Leave test cells blank until
+the validation decision in item 5.
 
-### 1. Environment and checks
+1. [x] [Verify the environment and pass the checks](#environment-and-checks).
+   Done 2026-09-12 on venus4 (2× A5500, idle): focused 8-file suite **94 passed**.
+   Deviation: `tests/test_env.py --require-gpu` fails in the available old image
+   (`~/pointcept.sif`, torch 2.5.0+cu124 — no `SharedArray`; the script pins the
+   newer cu128 image, absent here). All workload gates below ran in this image.
+2. [x] Complete **λ = 1**, run `ptv3-integrity-m1-w1-s1` — val-negative
+   (IoU 85.10, 55 low-purity pairs vs baseline 20); test cells blank.
+
+   - [x] [Select batch size and tune LR](#batch-and-lr-tuning). 2026-09-12:
+     batch probe → 2/GPU (total 4); LR test min-loss 0.0489, accepted max_lr
+     **0.02444** / block **0.002564** (flat valley, ~10× below explosion).
+     Artifacts: `exp/ribsegv2/ptv3-integrity-m1-w1-s1/tuning/`.
+   - [x] [Pass preflight and smoke checks](#preflight-and-smoke). 2026-09-12:
+     degenerate-rank DDP passed; smoke fit exit 0 (aux finite/nonzero all 212
+     iters, mean 0.78); smoke uncapped val eval passed. Exception: 200k×2
+     synthetic preflight OOMs at ~23.5 GB (genuine capacity; real-data smoke is
+     the operative memory gate). Details in `exp/ribsegv2/ptv3-integrity-m1-w1-s1/run.md`.
+   - [x] [Train 100 epochs and evaluate validation](#training-and-validation).
+     Fit exit 0 on venus4 2×A5500 (hook-best epoch 99); val eval seed 20260909.
+   - [x] [Record validation metrics and artifacts](#recording-and-comparison).
+     Val row filled 2026-09-12; extractor-verified against the two reference arms.
+
+3. [x] Complete **λ = 5**, run `ptv3-integrity-m1-w5-s1` — val-negative
+   (IoU 79.21, 231 low-purity pairs vs baseline 20); test cells blank.
+
+   - [x] [Select batch size and tune LR](#batch-and-lr-tuning). Batch 4 (2/GPU);
+     accepted max_lr **0.0183** / block **0.00192**. Artifacts: `tuning/`.
+   - [x] [Pass preflight and smoke checks](#preflight-and-smoke). New-run 200k×2
+     synthetic skipped (λ-independent OOM at ~23.5 GB, recorded under λ=1);
+     degenerate-rank DDP passed; smoke fit exit 0 (aux nonzero on all 212 iters,
+     mean 3.26); smoke uncapped val eval passed.
+   - [x] [Train 100 epochs and evaluate validation](#training-and-validation).
+     Fit exit 0 on venus4 2×A5500 (hook-best epoch 96); val eval seed 20260909.
+   - [x] [Record validation metrics and artifacts](#recording-and-comparison).
+     Val row filled 2026-09-13; extractor-verified against the reference arms.
+
+4. [x] Complete **λ = 10**, run `ptv3-integrity-m1-w10-s1` (on venus4) —
+   val-negative (IoU 64.30, 784 low-purity pairs vs baseline 20); test cells blank.
+
+    - [x] [Select batch size and tune LR](#batch-and-lr-tuning). Re-probed on
+      venus4 after the mars11 tuning (L4) was discarded: batch 4 (2/GPU); LR
+      test min-loss 0.0387, knee 0.0549, accepted max_lr **0.0183** / block
+      **0.00192** (same stable valley as the λ=5 tune on this node).
+    - [x] [Pass preflight and smoke checks](#preflight-and-smoke). 2026-09-13:
+      degenerate-rank DDP passed; smoke fit exit 0 (aux finite/nonzero all 212
+      iters, mean 6.85); smoke uncapped val eval passed. Earlier mars11 attempt
+      OOM'd in the smoke fit (L4 exposes 22.05 GiB vs A5500 23.56; batch 4 does
+      not fit real data there), so the arm moved to venus4 with fresh tuning.
+      Details in `exp/ribsegv2/ptv3-integrity-m1-w10-s1/run.md`.
+    - [x] [Train 100 epochs and evaluate validation](#training-and-validation).
+      Fit exit 0 on venus4 2×A5500 (hook-best epoch 100, train mIoU 0.6548);
+      val eval seed 20260909.
+    - [x] [Record validation metrics and artifacts](#recording-and-comparison).
+      Val row filled 2026-09-15; extractor-verified against the reference arms.
+
+5. [x] [Compare validation results](#recording-and-comparison). 2026-09-15:
+   **retain the baseline; no candidate selected.** λ = 1 (IoU 85.10, 55 pairs),
+   λ = 5 (79.21, 231 pairs) and λ = 10 (64.30, 784 pairs, frag>1 53.93%) are
+   all val-negative against baseline (87.76, 20 pairs) on overlap, purity and
+   fragmentation; λ = 0.1 was val-marginal but test-worse. Degradation grows
+   monotonically with λ. No promising candidate, so no matched-seed
+   confirmation runs.
+6. [x] ~~[Evaluate the selected candidate on test](#final-test-evaluation)~~ —
+   skipped: baseline retained after a negative sweep, per the plan's
+   "retain the baseline and record the negative sweep" clause. Test cells stay `—`.
+
+### Environment and checks
 
 Use the allocated GPUs in the [Pointcept container](env.md), with only those
 devices visible. Run these Bash blocks from the repository root in the same
@@ -110,7 +180,7 @@ python -m pytest -q -rs tests/test_instance_contrastive_loss.py \
   tests/test_extract_fg_purity.py
 ```
 
-### 2. Choose one arm and tune batch/LR
+### Batch and LR tuning
 
 Change only `INTEGRITY_LAMBDA` below to 1, 5 or 10; the run name follows it.
 Use a fresh directory for a new attempt. When resuming an unfinished run,
@@ -161,11 +231,11 @@ read -r -a INTEGRITY_TUNED_OPTIONS < "$INTEGRITY_TUNE_DIR/options.txt"
 Inspect the LR curve before accepting its suggestion. The batch probe measures
 one device; on heterogeneous GPUs, probe the most constrained device first.
 The LR search uses one GPU with accumulation to emulate the total batch.
-Confirm both decisions on all training ranks in stage 3, including the largest
+Confirm both decisions in [preflight and smoke](#preflight-and-smoke), including the largest
 capped batch and uncapped volume evaluation. If allocation changes, reconsider
 batch size and retune LR.
 
-### 3. Preflight and two-epoch smoke
+### Preflight and smoke
 
 ```bash
 torchrun --standalone --nproc_per_node="$INTEGRITY_GPUS" \
@@ -199,7 +269,7 @@ segmentation losses, pair counts, peak VRAM and step time. The smoke's val run
 checks uncapped evaluation memory; its metrics do not belong in the table.
 If a gate fails, record command/config/error and diagnose it before the full fit.
 
-### 4. Full fit and validation
+### Training and validation
 
 Start a fresh 100-epoch fit using this arm's selected settings; do not resume
 from its smoke checkpoint.
@@ -222,7 +292,7 @@ the current checkout with that saved config. Record both revisions and any
 uncommitted changes in `$INTEGRITY_RUN_DIR/run.md`, alongside GPU allocation,
 chosen batch/LRs, commands, runtime and checkpoint epoch.
 
-### 5. Record validation and compare
+### Recording and comparison
 
 Use [extracting fg purity results](#extracting-fg-purity-results) below to fill
 the val purity/count cells without requiring test output. For the other cells,
@@ -249,7 +319,7 @@ for purity counts. Record the choice and its rationale here. If a candidate
 looks promising, confirm it and the baseline with matched training seeds,
 using fresh names/rows and the same per-run tuning policy.
 
-### 6. Freeze the choice, then evaluate test
+### Final test evaluation
 
 Only evaluate a selected candidate after recording the validation decision;
 do not evaluate every trial on test to choose λ. If none improves the overall
@@ -283,7 +353,7 @@ python tools/ribsegv2/extract_fg_purity.py \
 
 Copy its median/max/min and count cells directly. Output always uses
 **val / test**; unrequested splits print `—`, never a fabricated count of zero.
-After stage 6, omit `--splits val` to extract both splits. Add `--format json`
+After step 6, omit `--splits val` to extract both splits. Add `--format json`
 to retain an audit record of the unrounded statistics and every qualifying
 `(volume, rib, purity)` pair; JSON purity values are fractions.
 
@@ -306,7 +376,7 @@ Local verification on 2026-09-12: **32 tuning/preflight/loss tests** and
 **51 reporting/extraction tests** passed, including validation-only extraction.
 The Bash blocks and historical table values were checked. Broader segmentor/CUDA
 checks require the runner container; this host lacks `torch_scatter`.
-Execute stage 1 in that environment before the sweep.
+Execute step 1 in that environment before the sweep.
 
 ## Method 1b — deferred
 
