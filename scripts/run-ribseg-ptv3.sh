@@ -60,6 +60,3 @@ bash scripts/test.sh -g 1 -d $dset -n $exp -p $py \
 bash scripts/test.sh -g 1 -d $dset -n $exp -p $py \
     -w model_best -o test.save_pred=False -o data.test.add_trainval_incomplete=False -o data.test.split=train \
     2> error.${0%.*}-test_trainset.log
-
-
-. $HOME/mail.sh "cmd done" "[`date`] `whoami`@`hostname`:`realpath ${BASH_SOURCE[0]}`, line $LINENO"

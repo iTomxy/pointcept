@@ -43,7 +43,7 @@ python -m pointcept.datasets.ribsegv2.preproc --recon-3d-bin \
 # re-preprocess npz for stage-2
 python -m pointcept.datasets.ribsegv2.preproc --preproc \
     --data-root $DATA_ROOT \
-    --bin-pred-path $RECON_DIR \
+    --bin-pred-path $BIN_RECON_DIR \
     --save-path $CACHE_ROOT_2 \
     --cache-root $CACHE_ROOT \
     --min-points 1

@@ -20,5 +20,3 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # only once they finish, so a cache that is there is complete. This is just the
 # figure to sanity-check a full run against.
 bash run-2stage.sh -d ribsegv2 -m semseg-pt_v3m1_0_base "$@"
-
-. $HOME/mail.sh "finish ${BASH_SOURCE[0]}" "Two-stage PTv3 pipeline completed."
